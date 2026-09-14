@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "minAppVersion": "0.15.0",
   "description": "Cross-platform bi-directional synchronization with Baidu Netdisk for Obsidian vaults.",
-  "author": "Sienchen",
-  "authorUrl": "https://github.com/sienchen",
+  "author": "owl234",
+  "authorUrl": "https://github.com/owl234",
   "isDesktopOnly": false
 }
