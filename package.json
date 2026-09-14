@@ -1,0 +1,28 @@
+{
+  "name": "obsidian-baidu-netdisk-sync",
+  "version": "1.0.0",
+  "description": "Cross-platform bi-directional synchronization with Baidu Netdisk for Obsidian vaults.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production",
+    "test": "npx esbuild tests/verify.ts --bundle --platform=node --outfile=dist/test.js && node dist/test.js"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "baidu-netdisk",
+    "sync",
+    "cloud"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "builtin-modules": "^5.0.0",
+    "esbuild": "0.24.2",
+    "obsidian": "latest",
+    "tslib": "2.8.1",
+    "typescript": "5.7.2"
+  }
+}

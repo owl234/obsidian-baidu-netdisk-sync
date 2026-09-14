@@ -1,0 +1,57 @@
+/* Baidu Netdisk Sync Plugin Styles */
+
+.baidu-sync-spinning {
+    animation: baidu-sync-rotate 1.2s linear infinite;
+}
+
+@keyframes baidu-sync-rotate {
+    100% {
+        transform: rotate(360deg);
+    }
+}
+
+.baidu-sync-status-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+
+.baidu-sync-status-bar:hover {
+    color: var(--text-accent);
+}
+
+.baidu-sync-log-modal {
+    max-width: 720px;
+    width: 100%;
+}
+
+.baidu-sync-log-container {
+    max-height: 400px;
+    overflow-y: auto;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    padding: 8px;
+    background-color: var(--background-secondary);
+    font-family: var(--font-monospace);
+    font-size: 12px;
+}
+
+.baidu-sync-log-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--background-modifier-border-focus);
+}
+
+.baidu-sync-log-row.error {
+    color: var(--text-error);
+}
+
+.baidu-sync-log-row.success {
+    color: var(--text-success);
+}
+
+.baidu-sync-log-row.info {
+    color: var(--text-muted);
+}

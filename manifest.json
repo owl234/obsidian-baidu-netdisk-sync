@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-baidu-netdisk-sync",
+  "name": "Baidu Netdisk Sync",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Cross-platform bi-directional synchronization with Baidu Netdisk for Obsidian vaults.",
+  "author": "Sienchen",
+  "authorUrl": "https://github.com/sienchen",
+  "isDesktopOnly": false
+}
