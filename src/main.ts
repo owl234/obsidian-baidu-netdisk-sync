@@ -24,7 +24,7 @@ export default class BaiduSyncPlugin extends Plugin {
     await this.loadSettings();
 
     // Initialize core subsystems
-    const manifestPath = `${this.manifest.dir || ".obsidian/plugins/obsidian-baidu-netdisk-sync"}/sync_manifest.json`;
+    const manifestPath = `${this.manifest.dir || ".obsidian/plugins/baidu-netdisk-sync"}/sync_manifest.json`;
     this.manifestMgr = new ManifestManager(this.app.vault.adapter, manifestPath);
 
     this.oauth = new BaiduOAuthManager(

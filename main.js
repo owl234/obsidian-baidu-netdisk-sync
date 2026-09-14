@@ -993,7 +993,7 @@ var SyncFilter = class {
   }
   shouldIgnore(relativePath) {
     const normalized = relativePath.replace(/\\/g, "/");
-    if (normalized.includes("obsidian-baidu-netdisk-sync") || normalized.endsWith("sync_manifest.json")) {
+    if (normalized.includes("baidu-netdisk-sync") || normalized.includes("obsidian-baidu-netdisk-sync") || normalized.endsWith("sync_manifest.json")) {
       return true;
     }
     if (normalized.startsWith(".trash/") || normalized === ".trash") {
@@ -1597,7 +1597,7 @@ var BaiduSyncPlugin = class extends import_obsidian6.Plugin {
   }
   async onload() {
     await this.loadSettings();
-    const manifestPath = `${this.manifest.dir || ".obsidian/plugins/obsidian-baidu-netdisk-sync"}/sync_manifest.json`;
+    const manifestPath = `${this.manifest.dir || ".obsidian/plugins/baidu-netdisk-sync"}/sync_manifest.json`;
     this.manifestMgr = new ManifestManager(this.app.vault.adapter, manifestPath);
     this.oauth = new BaiduOAuthManager(
       () => this.settings,

@@ -62,6 +62,7 @@ export class SyncFilter {
 
     // Always ignore plugin's own manifest and storage
     if (
+      normalized.includes("baidu-netdisk-sync") ||
       normalized.includes("obsidian-baidu-netdisk-sync") ||
       normalized.endsWith("sync_manifest.json")
     ) {
