@@ -49,9 +49,9 @@ export const DEFAULT_SETTINGS: BaiduSyncSettings = {
     "**/.git/**",
     "**/.DS_Store",
     "**/Thumbs.db",
-    "**/.obsidian/workspace*.json",
-    "**/.obsidian/cache/**",
-    "**/.obsidian/indexeddb/**"
+    "**/workspace*.json",
+    "**/cache/**",
+    "**/indexeddb/**"
   ].join("\n"),
 
   concurrency: 3,

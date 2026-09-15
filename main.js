@@ -48,9 +48,9 @@ var DEFAULT_SETTINGS = {
     "**/.git/**",
     "**/.DS_Store",
     "**/Thumbs.db",
-    "**/.obsidian/workspace*.json",
-    "**/.obsidian/cache/**",
-    "**/.obsidian/indexeddb/**"
+    "**/workspace*.json",
+    "**/cache/**",
+    "**/indexeddb/**"
   ].join("\n"),
   concurrency: 3,
   enableE2EE: false,
@@ -145,7 +145,7 @@ var BaiduSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       })
     );
     new import_obsidian.Setting(containerEl).setName("3. \u914D\u7F6E\u540C\u6B65\u4E0E\u6587\u4EF6\u8FC7\u6EE4").setHeading();
-    const configDirName = this.app.vault.configDir || ".obsidian";
+    const configDirName = this.app.vault.configDir;
     new import_obsidian.Setting(containerEl).setName(`\u540C\u6B65 ${configDirName} \u914D\u7F6E\u76EE\u5F55`).setDesc(`\u5F00\u542F\u540E\u5C06\u540C\u6B65 ${configDirName} \u4E2D\u7684\u63D2\u4EF6\u3001\u5916\u89C2\u4E0E\u5168\u5C40\u914D\u7F6E\uFF08\u81EA\u52A8\u6392\u9664 workspace.json \u5E03\u5C40\u7F13\u5B58\uFF09`).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.syncObsidianConfig).onChange(async (val) => {
         this.plugin.settings.syncObsidianConfig = val;
@@ -311,7 +311,7 @@ var BaiduOAuthManager = class {
       return settings.accessToken;
     } catch (err) {
       console.error("[BaiduSync] \u5237\u65B0 Token \u5931\u8D25:", err);
-      throw err;
+      throw err instanceof Error ? err : new Error(String(err));
     }
   }
   async getUserInfo() {
@@ -385,7 +385,7 @@ var BaiduClient = class {
               }
             }
           } catch (e) {
-            if (e.message && (e.message.includes("Rate Limit") || e.message.includes("Token expired"))) {
+            if (e instanceof Error && (e.message.includes("Rate Limit") || e.message.includes("Token expired"))) {
               throw e;
             }
           }
@@ -404,7 +404,7 @@ var BaiduClient = class {
         }
       }
     }
-    throw lastError;
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
   async listAll(rootPath) {
     const token = await this.oauth.refreshTokenIfNeeded();
@@ -979,7 +979,7 @@ function globToRegex(glob) {
   return new RegExp(regexStr);
 }
 var SyncFilter = class {
-  constructor(settings, configDir = ".obsidian") {
+  constructor(settings, configDir = "") {
     this.settings = settings;
     this.configDir = configDir;
     this.compiledPatterns = [];
@@ -1013,8 +1013,8 @@ var SyncFilter = class {
     if (normalized.startsWith(".git/") || normalized.includes("/.git/")) {
       return true;
     }
-    const configPrefix = this.configDir ? `${this.configDir}/` : ".obsidian/";
-    if (normalized.startsWith(configPrefix) || normalized.startsWith(".obsidian/")) {
+    const configPrefix = this.configDir ? `${this.configDir}/` : "";
+    if (configPrefix && normalized.startsWith(configPrefix)) {
       if (!this.settings.syncObsidianConfig) {
         return true;
       }
@@ -1261,7 +1261,7 @@ var SyncEngine = class {
     this.logs = [];
     this.onStateChangeListeners = [];
     const settings = this.getSettings();
-    this.filter = new SyncFilter(settings, this.app.vault.configDir || ".obsidian");
+    this.filter = new SyncFilter(settings, this.app.vault.configDir);
     this.queue = new AsyncQueue(settings.concurrency || 3);
     this.uploader = new BaiduUploader(this.client);
     this.downloader = new BaiduDownloader(this.client);
@@ -1478,8 +1478,8 @@ var SyncEngine = class {
     };
     await scanDirectory("");
     const settings = this.getSettings();
-    const configDir = this.app.vault.configDir || ".obsidian";
-    if (settings.syncObsidianConfig && await adapter.exists(configDir)) {
+    const configDir = this.app.vault.configDir;
+    if (settings.syncObsidianConfig && configDir && await adapter.exists(configDir)) {
       await scanDirectory(configDir);
     }
     return result;
@@ -1611,7 +1611,7 @@ var BaiduSyncPlugin = class extends import_obsidian6.Plugin {
   }
   async onload() {
     await this.loadSettings();
-    const configDir = this.app.vault.configDir || ".obsidian";
+    const configDir = this.app.vault.configDir;
     const manifestPath = `${this.manifest.dir || `${configDir}/plugins/baidu-netdisk-sync`}/sync_manifest.json`;
     this.manifestMgr = new ManifestManager(this.app.vault.adapter, manifestPath);
     this.oauth = new BaiduOAuthManager(

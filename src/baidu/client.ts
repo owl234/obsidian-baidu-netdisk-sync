@@ -19,7 +19,7 @@ export class BaiduClient {
     maxRetries = 3,
     initialDelayMs = 1000
   ): Promise<RequestUrlResponse> {
-    let lastError: any = null;
+    let lastError: unknown = null;
     let delay = initialDelayMs;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -28,7 +28,7 @@ export class BaiduClient {
         // Baidu sometimes returns HTTP 200 with errno: 31034 (QPS limit exceeded) or errno: -6 (invalid token)
         if (resp.status === 200) {
           try {
-            const data = resp.json;
+            const data = resp.json as { errno?: number } | undefined;
             if (data && typeof data === "object") {
               if (data.errno === 31034) {
                 // Rate limit hit
@@ -41,9 +41,9 @@ export class BaiduClient {
                 throw new Error("Token expired (errno: -6)");
               }
             }
-          } catch (e: any) {
+          } catch (e: unknown) {
             // If it's our re-thrown error, rethrow it
-            if (e.message && (e.message.includes("Rate Limit") || e.message.includes("Token expired"))) {
+            if (e instanceof Error && (e.message.includes("Rate Limit") || e.message.includes("Token expired"))) {
               throw e;
             }
             // Otherwise, resp is non-JSON file content (markdown, image, binary)
@@ -56,7 +56,7 @@ export class BaiduClient {
         }
 
         return resp;
-      } catch (err: any) {
+      } catch (err: unknown) {
         lastError = err;
         if (attempt < maxRetries) {
           // Exponential backoff with jitter
@@ -67,7 +67,7 @@ export class BaiduClient {
       }
     }
 
-    throw lastError;
+    throw (lastError instanceof Error ? lastError : new Error(String(lastError)));
   }
 
   async listAll(rootPath: string): Promise<BaiduFileItem[]> {

@@ -39,7 +39,7 @@ export class SyncEngine {
     private manifest: ManifestManager
   ) {
     const settings = this.getSettings();
-    this.filter = new SyncFilter(settings, this.app.vault.configDir || ".obsidian");
+    this.filter = new SyncFilter(settings, this.app.vault.configDir);
     this.queue = new AsyncQueue(settings.concurrency || 3);
     this.uploader = new BaiduUploader(this.client);
     this.downloader = new BaiduDownloader(this.client);
@@ -307,8 +307,8 @@ export class SyncEngine {
 
     // Scan config directory if enabled
     const settings = this.getSettings();
-    const configDir = this.app.vault.configDir || ".obsidian";
-    if (settings.syncObsidianConfig && (await adapter.exists(configDir))) {
+    const configDir = this.app.vault.configDir;
+    if (settings.syncObsidianConfig && configDir && (await adapter.exists(configDir))) {
       await scanDirectory(configDir);
     }
 

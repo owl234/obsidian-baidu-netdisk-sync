@@ -24,7 +24,7 @@ export default class BaiduSyncPlugin extends Plugin {
     await this.loadSettings();
 
     // Initialize core subsystems
-    const configDir = this.app.vault.configDir || ".obsidian";
+    const configDir = this.app.vault.configDir;
     const manifestPath = `${this.manifest.dir || `${configDir}/plugins/baidu-netdisk-sync`}/sync_manifest.json`;
     this.manifestMgr = new ManifestManager(this.app.vault.adapter, manifestPath);
 
@@ -113,7 +113,7 @@ export default class BaiduSyncPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<BaiduSyncSettings>);
   }
 
   async saveSettings(): Promise<void> {

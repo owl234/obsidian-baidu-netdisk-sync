@@ -33,7 +33,7 @@ function globToRegex(glob: string): RegExp {
 export class SyncFilter {
   private compiledPatterns: RegExp[] = [];
 
-  constructor(private settings: BaiduSyncSettings, private configDir: string = ".obsidian") {
+  constructor(private settings: BaiduSyncSettings, private configDir: string = "") {
     this.recompilePatterns();
   }
 
@@ -80,8 +80,8 @@ export class SyncFilter {
     }
 
     // Handle config folder configuration rules
-    const configPrefix = this.configDir ? `${this.configDir}/` : ".obsidian/";
-    if (normalized.startsWith(configPrefix) || normalized.startsWith(".obsidian/")) {
+    const configPrefix = this.configDir ? `${this.configDir}/` : "";
+    if (configPrefix && normalized.startsWith(configPrefix)) {
       if (!this.settings.syncObsidianConfig) {
         return true;
       }

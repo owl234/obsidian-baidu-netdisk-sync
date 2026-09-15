@@ -137,7 +137,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
     // Section 3: Scope and Filtering
     new Setting(containerEl).setName("3. 配置同步与文件过滤").setHeading();
 
-    const configDirName = this.app.vault.configDir || ".obsidian";
+    const configDirName = this.app.vault.configDir;
     new Setting(containerEl)
       .setName(`同步 ${configDirName} 配置目录`)
       .setDesc(`开启后将同步 ${configDirName} 中的插件、外观与全局配置（自动排除 workspace.json 布局缓存）`)

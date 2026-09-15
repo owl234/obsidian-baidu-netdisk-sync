@@ -111,9 +111,9 @@ export class BaiduOAuthManager {
       await this.saveSettings(settings);
 
       return settings.accessToken;
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("[BaiduSync] 刷新 Token 失败:", err);
-      throw err;
+      throw (err instanceof Error ? err : new Error(String(err)));
     }
   }
 
