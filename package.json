@@ -1,6 +1,6 @@
 {
   "name": "baidu-netdisk-sync",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Cross-platform bi-directional synchronization with Baidu Netdisk for your vaults.",
   "main": "main.js",
   "scripts": {
