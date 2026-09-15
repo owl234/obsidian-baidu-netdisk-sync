@@ -30,6 +30,7 @@ export class SyncEngine {
   private downloader: BaiduDownloader;
   private logs: SyncLogEntry[] = [];
   private onStateChangeListeners: Array<(state: SyncState, message?: string) => void> = [];
+  private onLogListeners: Array<(entry: SyncLogEntry) => void> = [];
 
   constructor(
     private app: App,
@@ -45,8 +46,18 @@ export class SyncEngine {
     this.downloader = new BaiduDownloader(this.client);
   }
 
-  onStateChange(listener: (state: SyncState, message?: string) => void): void {
+  onStateChange(listener: (state: SyncState, message?: string) => void): () => void {
     this.onStateChangeListeners.push(listener);
+    return () => {
+      this.onStateChangeListeners = this.onStateChangeListeners.filter((l) => l !== listener);
+    };
+  }
+
+  onLog(listener: (entry: SyncLogEntry) => void): () => void {
+    this.onLogListeners.push(listener);
+    return () => {
+      this.onLogListeners = this.onLogListeners.filter((l) => l !== listener);
+    };
   }
 
   private setState(state: SyncState, message?: string): void {
@@ -78,6 +89,13 @@ export class SyncEngine {
     this.logs.unshift(entry);
     if (this.logs.length > 200) {
       this.logs.pop();
+    }
+    for (const listener of this.onLogListeners) {
+      try {
+        listener(entry);
+      } catch {
+        // ignore listener errors
+      }
     }
   }
 

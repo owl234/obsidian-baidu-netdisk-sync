@@ -1260,6 +1260,7 @@ var SyncEngine = class {
     this.state = "idle";
     this.logs = [];
     this.onStateChangeListeners = [];
+    this.onLogListeners = [];
     const settings = this.getSettings();
     this.filter = new SyncFilter(settings, this.app.vault.configDir);
     this.queue = new AsyncQueue(settings.concurrency || 3);
@@ -1268,6 +1269,15 @@ var SyncEngine = class {
   }
   onStateChange(listener) {
     this.onStateChangeListeners.push(listener);
+    return () => {
+      this.onStateChangeListeners = this.onStateChangeListeners.filter((l) => l !== listener);
+    };
+  }
+  onLog(listener) {
+    this.onLogListeners.push(listener);
+    return () => {
+      this.onLogListeners = this.onLogListeners.filter((l) => l !== listener);
+    };
   }
   setState(state, message) {
     this.state = state;
@@ -1294,6 +1304,12 @@ var SyncEngine = class {
     this.logs.unshift(entry);
     if (this.logs.length > 200) {
       this.logs.pop();
+    }
+    for (const listener of this.onLogListeners) {
+      try {
+        listener(entry);
+      } catch {
+      }
     }
   }
   async startSync(silent = false) {
@@ -1554,22 +1570,57 @@ var SyncLogModal = class extends import_obsidian5.Modal {
   constructor(app, engine) {
     super(app);
     this.engine = engine;
+    this.logContainerEl = null;
+    this.statusDescEl = null;
   }
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("baidu-sync-log-modal");
     new import_obsidian5.Setting(contentEl).setName("\u767E\u5EA6\u7F51\u76D8\u540C\u6B65\u65E5\u5FD7").setHeading();
-    new import_obsidian5.Setting(contentEl).setName("\u7ACB\u5373\u6267\u884C\u540C\u6B65").setDesc("\u624B\u52A8\u89E6\u53D1\u5168\u91CF\u5BF9\u6BD4\u4E0E\u589E\u91CF\u53CC\u5411\u540C\u6B65").addButton((btn) => {
+    const syncSetting = new import_obsidian5.Setting(contentEl).setName("\u7ACB\u5373\u6267\u884C\u540C\u6B65").setDesc("\u624B\u52A8\u89E6\u53D1\u5168\u91CF\u5BF9\u6BD4\u4E0E\u589E\u91CF\u53CC\u5411\u540C\u6B65").addButton((btn) => {
       btn.setButtonText("\u5F00\u59CB\u540C\u6B65").setCta().onClick(async () => {
         btn.setDisabled(true);
+        btn.setButtonText("\u540C\u6B65\u4E2D...");
         await this.engine.startSync(false);
         btn.setDisabled(false);
-        this.renderLogs(container);
+        btn.setButtonText("\u5F00\u59CB\u540C\u6B65");
       });
     });
-    const container = contentEl.createDiv({ cls: "baidu-sync-log-container" });
-    this.renderLogs(container);
+    this.statusDescEl = syncSetting.descEl;
+    this.logContainerEl = contentEl.createDiv({ cls: "baidu-sync-log-container" });
+    this.renderLogs(this.logContainerEl);
+    this.unsubscribeLog = this.engine.onLog((entry) => {
+      if (this.logContainerEl) {
+        this.appendLogEntry(this.logContainerEl, entry);
+      }
+    });
+    this.unsubscribeState = this.engine.onStateChange((state, message) => {
+      if (this.statusDescEl) {
+        if (state === "syncing" || state === "diffing" || state === "preparing") {
+          this.statusDescEl.setText(`\u{1F504} ${message || "\u6B63\u5728\u540C\u6B65\u4E2D..."}`);
+        } else if (state === "error") {
+          this.statusDescEl.setText(`\u26A0\uFE0F \u540C\u6B65\u5F02\u5E38: ${message || "\u53D1\u751F\u9519\u8BEF"}`);
+        } else {
+          this.statusDescEl.setText("\u624B\u52A8\u89E6\u53D1\u5168\u91CF\u5BF9\u6BD4\u4E0E\u589E\u91CF\u53CC\u5411\u540C\u6B65");
+        }
+      }
+    });
+  }
+  appendLogEntry(container, log) {
+    const emptyEl = container.querySelector(".baidu-sync-log-empty");
+    if (emptyEl) {
+      emptyEl.remove();
+    }
+    const row = createDiv({ cls: `baidu-sync-log-row ${log.level}` });
+    const timeStr = new Date(log.timestamp).toLocaleTimeString();
+    const left = row.createDiv();
+    left.createSpan({ text: `[${timeStr}] `, cls: "log-time" });
+    left.createSpan({ text: log.message, cls: "log-msg" });
+    if (log.detail) {
+      row.createDiv({ text: log.detail, cls: "log-detail" });
+    }
+    container.prepend(row);
   }
   renderLogs(container) {
     container.empty();
@@ -1577,7 +1628,7 @@ var SyncLogModal = class extends import_obsidian5.Modal {
     if (logs.length === 0) {
       container.createEl("p", {
         text: "\u6682\u65E0\u540C\u6B65\u65E5\u5FD7\u8BB0\u5F55",
-        cls: "baidu-sync-log-row info"
+        cls: "baidu-sync-log-row info baidu-sync-log-empty"
       });
       return;
     }
@@ -1595,6 +1646,12 @@ var SyncLogModal = class extends import_obsidian5.Modal {
     }
   }
   onClose() {
+    this.unsubscribeLog?.();
+    this.unsubscribeState?.();
+    this.unsubscribeLog = void 0;
+    this.unsubscribeState = void 0;
+    this.logContainerEl = null;
+    this.statusDescEl = null;
     const { contentEl } = this;
     contentEl.empty();
   }

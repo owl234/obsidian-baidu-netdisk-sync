@@ -1,7 +1,7 @@
 {
   "id": "baidu-netdisk-sync",
   "name": "Baidu Netdisk Sync",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "minAppVersion": "1.6.6",
   "description": "Cross-platform bi-directional synchronization with Baidu Netdisk for your vaults.",
   "author": "owl234",
