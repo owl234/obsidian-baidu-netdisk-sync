@@ -1,6 +1,5 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type BaiduSyncPlugin from "../main";
-import { BaiduSyncSettings } from "./settings";
 
 export class BaiduSyncSettingTab extends PluginSettingTab {
   plugin: BaiduSyncPlugin;
@@ -14,17 +13,27 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "百度网盘同步设置" });
+    new Setting(containerEl).setName("百度网盘同步设置").setHeading();
 
     // Section 1: Authentication
-    containerEl.createEl("h3", { text: "1. 百度网盘账号授权 (OAuth 2.0)" });
+    new Setting(containerEl).setName("1. 百度网盘账号授权 (OAuth 2.0)").setHeading();
 
     const authDesc = containerEl.createDiv({ cls: "setting-item-description" });
-    authDesc.innerHTML = `
-      1. 访问 <a href="https://pan.baidu.com/union" target="_blank">百度网盘开放平台</a> 登录并创建个人开发者应用。<br>
-      2. 获取应用的 <b>AppKey</b> 与 <b>AppSecret</b> 并填入下方。<br>
-      3. 点击“获取网页授权码”，在弹出的页面登录并授权，将网页返回的授权码粘贴至下方换取 Token。
-    `;
+    const p1 = authDesc.createDiv();
+    p1.appendText("1. 访问 ");
+    const link = p1.createEl("a", { text: "百度网盘开放平台", href: "https://pan.baidu.com/union" });
+    link.setAttr("target", "_blank");
+    p1.appendText(" 登录并创建个人开发者应用。");
+
+    const p2 = authDesc.createDiv();
+    p2.appendText("2. 获取应用的 ");
+    p2.createEl("b", { text: "AppKey" });
+    p2.appendText(" 与 ");
+    p2.createEl("b", { text: "AppSecret" });
+    p2.appendText(" 并填入下方。");
+
+    const p3 = authDesc.createDiv();
+    p3.appendText("3. 点击“获取网页授权码”，在弹出的页面登录并授权，将网页返回的授权码粘贴至下方换取 Token。");
 
     new Setting(containerEl)
       .setName("AppKey (Client ID)")
@@ -67,8 +76,9 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
             const url = this.plugin.oauth.getOAuthUrl();
             window.open(url);
             new Notice("请在浏览器完成授权，并复制网页中的授权码！");
-          } catch (err: any) {
-            new Notice(err.message || "请先填写 AppKey");
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "请先填写 AppKey";
+            new Notice(msg);
           }
         })
       );
@@ -98,8 +108,9 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
               await this.plugin.oauth.exchangeCodeForToken(authCodeInput);
               new Notice("🎉 百度网盘账号绑定成功！");
               this.display(); // Refresh tab view
-            } catch (err: any) {
-              new Notice(`绑定失败: ${err.message}`);
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : String(err);
+              new Notice(`绑定失败: ${msg}`);
             } finally {
               btn.setDisabled(false);
               btn.setButtonText("第二步：确认换取 Token");
@@ -108,7 +119,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     // Section 2: Storage Path
-    containerEl.createEl("h3", { text: "2. 存储与目录规划" });
+    new Setting(containerEl).setName("2. 存储与目录规划").setHeading();
 
     new Setting(containerEl)
       .setName("网盘端根目录")
@@ -124,11 +135,12 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     // Section 3: Scope and Filtering
-    containerEl.createEl("h3", { text: "3. 配置同步与文件过滤" });
+    new Setting(containerEl).setName("3. 配置同步与文件过滤").setHeading();
 
+    const configDirName = this.app.vault.configDir || ".obsidian";
     new Setting(containerEl)
-      .setName("同步 .obsidian 配置目录")
-      .setDesc("开启后将同步 Obsidian 的插件、外观与全局配置（自动排除 workspace.json 布局缓存）")
+      .setName(`同步 ${configDirName} 配置目录`)
+      .setDesc(`开启后将同步 ${configDirName} 中的插件、外观与全局配置（自动排除 workspace.json 布局缓存）`)
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.syncObsidianConfig)
@@ -139,7 +151,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("同步第三方插件 (.obsidian/plugins)")
+      .setName(`同步第三方插件 (${configDirName}/plugins)`)
       .setDesc("开启后将在多端同步已安装的社区插件")
       .addToggle((toggle) =>
         toggle
@@ -151,7 +163,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("同步外观与主题 (.obsidian/themes)")
+      .setName(`同步外观与主题 (${configDirName}/themes)`)
       .setDesc("开启后同步已下载的主题与 CSS 片段")
       .addToggle((toggle) =>
         toggle
@@ -167,7 +179,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       .setDesc("每行一条 Glob 匹配规则，匹配的文件将完全不参与同步")
       .addTextArea((area) => {
         area.inputEl.rows = 6;
-        area.inputEl.style.width = "100%";
+        area.inputEl.addClass("baidu-sync-textarea");
         area
           .setValue(this.plugin.settings.ignoredPatterns)
           .onChange(async (val) => {
@@ -177,7 +189,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       });
 
     // Section 4: Trigger Settings
-    containerEl.createEl("h3", { text: "4. 同步触发机制" });
+    new Setting(containerEl).setName("4. 同步触发机制").setHeading();
 
     new Setting(containerEl)
       .setName("启动时自动同步")
@@ -219,7 +231,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     // Section 5: Concurrency & Performance
-    containerEl.createEl("h3", { text: "5. 传输调度与网络并发" });
+    new Setting(containerEl).setName("5. 传输调度与网络并发").setHeading();
 
     new Setting(containerEl)
       .setName("并发传输请求数 (1~5)")
@@ -228,7 +240,6 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
         slider
           .setLimits(1, 5, 1)
           .setValue(this.plugin.settings.concurrency)
-          .setDynamicTooltip()
           .onChange(async (val) => {
             this.plugin.settings.concurrency = val;
             await this.plugin.saveSettings();
@@ -236,7 +247,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     // Section 6: End-to-End Encryption
-    containerEl.createEl("h3", { text: "6. 端到端隐私加密 (E2EE)" });
+    new Setting(containerEl).setName("6. 端到端隐私加密 (E2EE)").setHeading();
 
     new Setting(containerEl)
       .setName("开启 AES-256-GCM 端到端加密")

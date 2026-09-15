@@ -101,7 +101,7 @@ export async function decryptData(encryptedBuffer: ArrayBuffer, password: string
       key,
       ciphertext
     );
-  } catch (err) {
+  } catch {
     throw new Error("E2EE 解密失败：密码错误或文件损坏");
   }
 }

@@ -33,7 +33,7 @@ function globToRegex(glob: string): RegExp {
 export class SyncFilter {
   private compiledPatterns: RegExp[] = [];
 
-  constructor(private settings: BaiduSyncSettings) {
+  constructor(private settings: BaiduSyncSettings, private configDir: string = ".obsidian") {
     this.recompilePatterns();
   }
 
@@ -50,8 +50,8 @@ export class SyncFilter {
       if (trimmed && !trimmed.startsWith("#")) {
         try {
           this.compiledPatterns.push(globToRegex(trimmed));
-        } catch (e) {
-          console.warn("[BaiduSync] 忽略无效过滤规则:", trimmed, e);
+        } catch {
+          // ignore invalid patterns
         }
       }
     }
@@ -79,8 +79,9 @@ export class SyncFilter {
       return true;
     }
 
-    // Handle .obsidian folder configuration rules
-    if (normalized.startsWith(".obsidian/")) {
+    // Handle config folder configuration rules
+    const configPrefix = this.configDir ? `${this.configDir}/` : ".obsidian/";
+    if (normalized.startsWith(configPrefix) || normalized.startsWith(".obsidian/")) {
       if (!this.settings.syncObsidianConfig) {
         return true;
       }
@@ -89,21 +90,21 @@ export class SyncFilter {
       if (
         normalized.includes("/workspace.json") ||
         normalized.includes("/workspace-mobile.json") ||
-        normalized.startsWith(".obsidian/workspace.json") ||
-        normalized.startsWith(".obsidian/workspace-mobile.json") ||
-        normalized.startsWith(".obsidian/cache/") ||
-        normalized.startsWith(".obsidian/indexeddb/")
+        normalized.endsWith("/workspace.json") ||
+        normalized.endsWith("/workspace-mobile.json") ||
+        normalized.includes("/cache/") ||
+        normalized.includes("/indexeddb/")
       ) {
         return true;
       }
 
       // Plugins rule
-      if (!this.settings.syncPlugins && normalized.startsWith(".obsidian/plugins/")) {
+      if (!this.settings.syncPlugins && normalized.includes("/plugins/")) {
         return true;
       }
 
       // Themes rule
-      if (!this.settings.syncThemes && normalized.startsWith(".obsidian/themes/")) {
+      if (!this.settings.syncThemes && normalized.includes("/themes/")) {
         return true;
       }
     }

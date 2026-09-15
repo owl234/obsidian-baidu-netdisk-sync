@@ -61,7 +61,7 @@ export class BaiduClient {
         if (attempt < maxRetries) {
           // Exponential backoff with jitter
           const jitter = Math.random() * 300;
-          await new Promise((r) => setTimeout(r, delay + jitter));
+          await new Promise((r) => window.setTimeout(r, delay + jitter));
           delay *= 2;
         }
       }

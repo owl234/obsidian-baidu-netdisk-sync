@@ -24,7 +24,8 @@ export default class BaiduSyncPlugin extends Plugin {
     await this.loadSettings();
 
     // Initialize core subsystems
-    const manifestPath = `${this.manifest.dir || ".obsidian/plugins/baidu-netdisk-sync"}/sync_manifest.json`;
+    const configDir = this.app.vault.configDir || ".obsidian";
+    const manifestPath = `${this.manifest.dir || `${configDir}/plugins/baidu-netdisk-sync`}/sync_manifest.json`;
     this.manifestMgr = new ManifestManager(this.app.vault.adapter, manifestPath);
 
     this.oauth = new BaiduOAuthManager(
@@ -98,8 +99,6 @@ export default class BaiduSyncPlugin extends Plugin {
 
     // Setup Automation Triggers
     this.setupTriggers();
-
-    console.log("[BaiduSync] 百度网盘同步插件已成功加载");
   }
 
   onunload(): void {
@@ -111,7 +110,6 @@ export default class BaiduSyncPlugin extends Plugin {
       window.clearTimeout(this.saveDebounceTimer);
       this.saveDebounceTimer = null;
     }
-    console.log("[BaiduSync] 百度网盘同步插件已卸载");
   }
 
   async loadSettings(): Promise<void> {
@@ -132,7 +130,6 @@ export default class BaiduSyncPlugin extends Plugin {
       const ms = this.settings.syncIntervalMinutes * 60 * 1000;
       this.intervalId = window.setInterval(async () => {
         if (this.settings.accessToken) {
-          console.log("[BaiduSync] 触发定时同步任务");
           await this.engine.startSync(true); // Silent sync
         }
       }, ms);
@@ -143,8 +140,7 @@ export default class BaiduSyncPlugin extends Plugin {
     // 1. Startup trigger
     if (this.settings.syncOnStartup && this.settings.accessToken) {
       // Delay 3s to let Obsidian complete internal indexing
-      setTimeout(async () => {
-        console.log("[BaiduSync] 触发启动自动同步");
+      window.setTimeout(async () => {
         await this.engine.startSync(true);
       }, 3000);
     }
@@ -164,7 +160,6 @@ export default class BaiduSyncPlugin extends Plugin {
 
       const debounceMs = (this.settings.syncDebounceSeconds || 5) * 1000;
       this.saveDebounceTimer = window.setTimeout(async () => {
-        console.log("[BaiduSync] 触发保存防抖同步");
         await this.engine.startSync(true);
       }, debounceMs);
     };

@@ -55,3 +55,8 @@
 .baidu-sync-log-row.info {
     color: var(--text-muted);
 }
+
+.baidu-sync-textarea {
+    width: 100%;
+    min-height: 120px;
+}

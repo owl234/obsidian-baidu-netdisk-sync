@@ -15,7 +15,7 @@ export class AsyncQueue {
           const res = await task();
           resolve(res);
         } catch (err) {
-          reject(err);
+          reject(err instanceof Error ? err : new Error(String(err)));
         } finally {
           this.activeCount--;
           this.next();
@@ -32,14 +32,14 @@ export class AsyncQueue {
       const task = this.queue.shift();
       if (task) {
         this.activeCount++;
-        task();
+        void task();
       }
     }
   }
 
   async waitAll(): Promise<void> {
     while (this.activeCount > 0 || this.queue.length > 0) {
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => window.setTimeout(r, 50));
     }
   }
 }

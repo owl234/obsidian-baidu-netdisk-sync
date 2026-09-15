@@ -1,5 +1,5 @@
 import { App, Modal, Setting } from "obsidian";
-import { SyncEngine, SyncLogEntry } from "../sync/engine";
+import { SyncEngine } from "../sync/engine";
 
 export class SyncLogModal extends Modal {
   constructor(app: App, private engine: SyncEngine) {
@@ -11,7 +11,7 @@ export class SyncLogModal extends Modal {
     contentEl.empty();
     contentEl.addClass("baidu-sync-log-modal");
 
-    contentEl.createEl("h2", { text: "百度网盘同步日志" });
+    new Setting(contentEl).setName("百度网盘同步日志").setHeading();
 
     new Setting(contentEl)
       .setName("立即执行同步")

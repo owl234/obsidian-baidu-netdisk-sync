@@ -3,7 +3,7 @@ import { BaiduSyncSettings } from "../settings/settings";
 import { BaiduClient } from "../baidu/client";
 import { BaiduUploader } from "../baidu/uploader";
 import { BaiduDownloader } from "../baidu/downloader";
-import { ManifestManager, ManifestItem } from "./manifest";
+import { ManifestManager } from "./manifest";
 import { SyncFilter } from "./filter";
 import { AsyncQueue } from "./queue";
 import {
@@ -39,7 +39,7 @@ export class SyncEngine {
     private manifest: ManifestManager
   ) {
     const settings = this.getSettings();
-    this.filter = new SyncFilter(settings);
+    this.filter = new SyncFilter(settings, this.app.vault.configDir || ".obsidian");
     this.queue = new AsyncQueue(settings.concurrency || 3);
     this.uploader = new BaiduUploader(this.client);
     this.downloader = new BaiduDownloader(this.client);
@@ -79,7 +79,6 @@ export class SyncEngine {
     if (this.logs.length > 200) {
       this.logs.pop();
     }
-    console.log(`[BaiduSync][${level.toUpperCase()}] ${message}`, detail || "");
   }
 
   async startSync(silent = false): Promise<{ success: boolean; stats: { uploaded: number; downloaded: number; deleted: number; errors: number } }> {
@@ -141,9 +140,10 @@ export class SyncEngine {
             if (item.action === "UPLOAD") stats.uploaded++;
             else if (item.action === "DOWNLOAD") stats.downloaded++;
             else if (item.action === "DELETE_LOCAL" || item.action === "DELETE_REMOTE") stats.deleted++;
-          } catch (err: any) {
+          } catch (err: unknown) {
             stats.errors++;
-            this.addLog("error", `处理失败: ${item.path}`, err.message || String(err));
+            const msg = err instanceof Error ? err.message : String(err);
+            this.addLog("error", `处理失败: ${item.path}`, msg);
           } finally {
             processed++;
             this.setState("syncing", `同步中 (${processed}/${plans.length})...`);
@@ -166,9 +166,10 @@ export class SyncEngine {
 
       this.setState("idle", "同步完成");
       return { success: stats.errors === 0, stats };
-    } catch (err: any) {
-      this.addLog("error", "同步过程中发生严重异常", err.message || String(err));
-      this.setState("error", err.message || "同步异常");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.addLog("error", "同步过程中发生严重异常", msg);
+      this.setState("error", msg);
       return { success: false, stats };
     }
   }
@@ -244,9 +245,9 @@ export class SyncEngine {
         if (await adapter.exists(item.path)) {
           const file = this.app.vault.getAbstractFileByPath(item.path);
           if (file && file instanceof TFile) {
-            await this.app.vault.trash(file, false); // Move to Obsidian .trash
+            await this.app.fileManager.trashFile(file); // Respect user trash preference
           } else {
-            // For files under .obsidian or files not indexed by Vault
+            // For files under config directory or files not indexed by Vault
             await adapter.trashLocal(item.path);
           }
           this.addLog("info", `移入本地回收站: ${item.path}`);
@@ -304,10 +305,11 @@ export class SyncEngine {
     // Scan regular vault contents
     await scanDirectory("");
 
-    // Scan .obsidian config if enabled
+    // Scan config directory if enabled
     const settings = this.getSettings();
-    if (settings.syncObsidianConfig && (await adapter.exists(".obsidian"))) {
-      await scanDirectory(".obsidian");
+    const configDir = this.app.vault.configDir || ".obsidian";
+    if (settings.syncObsidianConfig && (await adapter.exists(configDir))) {
+      await scanDirectory(configDir);
     }
 
     return result;
