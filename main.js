@@ -272,21 +272,21 @@ var BaiduOAuthManager = class {
   async refreshTokenIfNeeded(force = false) {
     const settings = this.getSettings();
     if (!settings.refreshToken) {
-      throw new Error("\u5C1A\u672A\u6388\u6743\u767E\u5EA6\u7F51\u76D8\u8D26\u53F7\uFF0C\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u5B8C\u6210\u6388\u6743");
+      throw new Error("\u5C1A\u672A\u6388\u6743\u767E\u5EA6\u7F51\u76D8\u8D26\u53F7\uFF0C\u8BF7\u5148\u5728\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u5B8C\u6210\u6388\u6743");
     }
-    const now = Date.now();
-    const shouldRefresh = force || !settings.tokenExpiresAt || settings.tokenExpiresAt - now < 24 * 3600 * 1e3;
-    if (!shouldRefresh && settings.accessToken) {
+    const oneDayMs = 24 * 60 * 60 * 1e3;
+    const isExpired = Date.now() + oneDayMs > settings.tokenExpiresAt;
+    if (!force && !isExpired && settings.accessToken) {
       return settings.accessToken;
     }
-    const url = "https://openapi.baidu.com/oauth/2.0/token";
-    const body = new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: settings.refreshToken,
-      client_id: settings.appKey.trim(),
-      client_secret: settings.appSecret.trim()
-    });
     try {
+      const url = "https://openapi.baidu.com/oauth/2.0/token";
+      const body = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: settings.refreshToken,
+        client_id: settings.appKey,
+        client_secret: settings.appSecret
+      });
       const resp = await (0, import_obsidian2.requestUrl)({
         url,
         method: "POST",

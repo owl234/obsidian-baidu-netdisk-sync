@@ -96,7 +96,7 @@ export class BaiduClient {
           throw new Error(`获取网盘文件列表失败: HTTP ${resp.status}`);
         }
 
-        const data: BaiduListResponse = resp.json;
+        const data = resp.json as unknown as BaiduListResponse;
         // errno -9: path does not exist; errno 31066: directory not found; errno 20020: empty/uninitialized path
         if (data.errno === -9 || data.errno === 31066 || data.errno === 20020) {
           hasMore = false;
@@ -142,7 +142,7 @@ export class BaiduClient {
       throw new Error(`获取文件元数据失败: HTTP ${resp.status}`);
     }
 
-    const data: BaiduFileMetasResponse = resp.json;
+    const data = resp.json as unknown as BaiduFileMetasResponse;
     if (!data.list || data.list.length === 0) {
       throw new Error(`未找到文件元数据 fsId=${fsId}`);
     }
@@ -196,7 +196,7 @@ export class BaiduClient {
       throw new Error(`Precreate 失败 (HTTP ${resp.status}): ${resp.text}`);
     }
 
-    const data: BaiduPrecreateResponse = resp.json;
+    const data = resp.json as unknown as BaiduPrecreateResponse;
     if (data.errno !== 0) {
       throw new Error(`Precreate 错误 [errno: ${data.errno}]: ${resp.text}`);
     }
@@ -262,7 +262,7 @@ export class BaiduClient {
       throw new Error(`合并创建文件失败 (HTTP ${resp.status}): ${resp.text}`);
     }
 
-    const data: BaiduCreateResponse = resp.json;
+    const data = resp.json as unknown as BaiduCreateResponse;
     if (data.errno !== 0) {
       throw new Error(`落盘创建文件错误 [errno: ${data.errno}]: ${resp.text}`);
     }
@@ -290,7 +290,7 @@ export class BaiduClient {
       body: body.toString()
     });
 
-    const data: BaiduCreateResponse = resp.json;
+    const data = resp.json as unknown as BaiduCreateResponse;
     // errno 0 = success, -8 = dir already exists (ignore)
     if (data.errno !== 0 && data.errno !== -8) {
       console.warn(`创建目录警告 path=${remotePath} errno=${data.errno}`);
@@ -320,7 +320,7 @@ export class BaiduClient {
       throw new Error(`删除网盘文件失败 (HTTP ${resp.status}): ${resp.text}`);
     }
 
-    const data: BaiduFileManagerResponse = resp.json;
+    const data = resp.json as unknown as BaiduFileManagerResponse;
     if (data.errno !== 0) {
       throw new Error(`删除网盘文件错误 [errno: ${data.errno}]: ${resp.text}`);
     }

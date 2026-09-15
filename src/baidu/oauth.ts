@@ -46,14 +46,13 @@ export class BaiduOAuthManager {
       throw new Error(`获取 Token 失败 (HTTP ${resp.status}): ${resp.text}`);
     }
 
-    const tokenData: BaiduTokenResponse = resp.json;
+    const tokenData = resp.json as unknown as BaiduTokenResponse;
     if (tokenData.error) {
       throw new Error(`授权错误 [${tokenData.error}]: ${tokenData.error_description || "未知错误"}`);
     }
 
     const now = Date.now();
     const expiresInMs = (tokenData.expires_in || 2592000) * 1000;
-
     settings.accessToken = tokenData.access_token;
     settings.refreshToken = tokenData.refresh_token;
     settings.tokenExpiresAt = now + expiresInMs;
@@ -65,26 +64,26 @@ export class BaiduOAuthManager {
   async refreshTokenIfNeeded(force = false): Promise<string> {
     const settings = this.getSettings();
     if (!settings.refreshToken) {
-      throw new Error("尚未授权百度网盘账号，请先在设置中完成授权");
+      throw new Error("尚未授权百度网盘账号，请先在插件设置中完成授权");
     }
 
-    const now = Date.now();
-    // Refresh if less than 24 hours remaining or expired or forced
-    const shouldRefresh = force || !settings.tokenExpiresAt || settings.tokenExpiresAt - now < 24 * 3600 * 1000;
+    // Refresh 1 day before expiration
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    const isExpired = Date.now() + oneDayMs > settings.tokenExpiresAt;
 
-    if (!shouldRefresh && settings.accessToken) {
+    if (!force && !isExpired && settings.accessToken) {
       return settings.accessToken;
     }
 
-    const url = "https://openapi.baidu.com/oauth/2.0/token";
-    const body = new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: settings.refreshToken,
-      client_id: settings.appKey.trim(),
-      client_secret: settings.appSecret.trim()
-    });
-
     try {
+      const url = "https://openapi.baidu.com/oauth/2.0/token";
+      const body = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: settings.refreshToken,
+        client_id: settings.appKey,
+        client_secret: settings.appSecret
+      });
+
       const resp = await requestUrl({
         url,
         method: "POST",
@@ -98,7 +97,7 @@ export class BaiduOAuthManager {
         throw new Error(`刷新 Token 失败 (HTTP ${resp.status}): ${resp.text}`);
       }
 
-      const tokenData: BaiduTokenResponse = resp.json;
+      const tokenData = resp.json as unknown as BaiduTokenResponse;
       if (tokenData.error) {
         throw new Error(`刷新 Token 异常 [${tokenData.error}]: ${tokenData.error_description || "未知错误"}`);
       }

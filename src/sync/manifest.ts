@@ -33,7 +33,7 @@ export class ManifestManager {
     try {
       if (await this.adapter.exists(this.manifestFilePath)) {
         const raw = await this.adapter.read(this.manifestFilePath);
-        this.manifest = JSON.parse(raw);
+        this.manifest = JSON.parse(raw) as unknown as SyncManifest;
         if (!this.manifest.files) {
           this.manifest.files = {};
         }
