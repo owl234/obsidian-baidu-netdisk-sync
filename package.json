@@ -1,7 +1,7 @@
 {
   "name": "obsidian-baidu-netdisk-sync",
-  "version": "1.0.6",
-  "description": "Cross-platform bi-directional synchronization with Baidu Netdisk for your vaults.",
+  "version": "1.0.7",
+  "description": "Free cross-platform multi-device sync with Baidu Netdisk (iOS/Android/Desktop). 免费多端/多设备百度网盘双向同步。",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",

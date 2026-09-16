@@ -3,6 +3,7 @@ import { md5 } from "../src/crypto/md5";
 import { SyncPlanner, LocalFileInfo, RemoteFileInfo } from "../src/sync/planner";
 import { SyncFilter } from "../src/sync/filter";
 import { DEFAULT_SETTINGS } from "../src/settings/settings";
+import { exportEncryptedConfig, importEncryptedConfig } from "../src/crypto/configShare";
 
 function testMD5() {
   console.log("-> Testing MD5...");
@@ -179,11 +180,110 @@ function testPlannerLWW() {
   console.log("   SyncPlanner tests passed!");
 }
 
-function runAll() {
+async function testConfigShare() {
+  console.log("-> Testing ConfigShare (Multi-device encrypted config export/import)...");
+  const dummySettings: any = {
+    ...DEFAULT_SETTINGS,
+    appKey: "testAppKey123",
+    appSecret: "testAppSecret456",
+    accessToken: "fakeToken123456",
+    refreshToken: "fakeRefresh789",
+    tokenExpiresAt: 1735689600000,
+    remoteBasePath: "/apps/test_sync",
+    syncObsidianConfig: true,
+    syncPlugins: true,
+    syncThemes: false,
+    ignoredPatterns: "**/.git/**\n**/workspace*.json",
+    concurrency: 4,
+    enableE2EE: true,
+    e2eePassword: "MyMasterVaultPassword!"
+  };
+
+  const pin = "SafePin9876";
+
+  // 1. Export encrypted pairing code
+  const pairingCode = await exportEncryptedConfig(dummySettings, pin);
+  assert.ok(pairingCode.startsWith("BDSYNC:v1:"), "Pairing code must start with BDSYNC:v1:");
+
+  // 2. Import with correct pin
+  const imported = await importEncryptedConfig(pairingCode, pin);
+  assert.strictEqual(imported.appKey, dummySettings.appKey, "appKey mismatch");
+  assert.strictEqual(imported.appSecret, dummySettings.appSecret, "appSecret mismatch");
+  assert.strictEqual(imported.accessToken, dummySettings.accessToken, "accessToken mismatch");
+  assert.strictEqual(imported.refreshToken, dummySettings.refreshToken, "refreshToken mismatch");
+  assert.strictEqual(imported.remoteBasePath, dummySettings.remoteBasePath, "remoteBasePath mismatch");
+  assert.strictEqual(imported.enableE2EE, true, "enableE2EE mismatch");
+  assert.strictEqual(imported.e2eePassword, "MyMasterVaultPassword!", "e2eePassword mismatch");
+  assert.strictEqual(imported.concurrency, 4, "concurrency mismatch");
+
+  // 3. Import with incorrect pin -> should fail
+  let failed = false;
+  try {
+    await importEncryptedConfig(pairingCode, "WrongPin123");
+  } catch (err: any) {
+    failed = true;
+    assert.ok(err.message.includes("解密失败"), "Error message should mention decryption failure");
+  }
+  assert.ok(failed, "Import with wrong PIN must throw error");
+
+  // 4. Corrupted code -> should fail
+  let corruptedFailed = false;
+  try {
+    await importEncryptedConfig("BDSYNC:v1:corruptedPayload!!!", pin);
+  } catch (err) {
+    corruptedFailed = true;
+  }
+  assert.ok(corruptedFailed, "Import with corrupted code must throw error");
+
+  // 5. Empty / Whitespace PIN boundary tests
+  let emptyPinExport = false;
+  try {
+    await exportEncryptedConfig(dummySettings, "   ");
+  } catch (err: any) {
+    emptyPinExport = true;
+    assert.ok(err.message.includes("不能为空"), "Must reject empty pin on export");
+  }
+  assert.ok(emptyPinExport, "Export with empty PIN must throw");
+
+  let emptyPinImport = false;
+  try {
+    await importEncryptedConfig(pairingCode, "  ");
+  } catch (err: any) {
+    emptyPinImport = true;
+    assert.ok(err.message.includes("请输入配对保护密码"), "Must reject empty pin on import");
+  }
+  assert.ok(emptyPinImport, "Import with empty PIN must throw");
+
+  // 6. Security Defense: Reject Plaintext Downgrade / PIN Bypass Attack
+  const fakePlaintextJson = JSON.stringify({
+    remoteBasePath: "/hacked",
+    appKey: "evilKey",
+    appSecret: "evilSecret"
+  });
+  const unencryptedBase64 = Buffer.from(fakePlaintextJson).toString("base64");
+  const bypassPayload = `BDSYNC:v1:${unencryptedBase64}`;
+
+  let downgradeBlocked = false;
+  try {
+    await importEncryptedConfig(bypassPayload, "AnyPin");
+  } catch (err: any) {
+    downgradeBlocked = true;
+    assert.ok(err.message.includes("未经过加密保护"), "Must block unencrypted downgrade payload");
+  }
+  assert.ok(downgradeBlocked, "Plaintext downgrade bypass attack must be blocked");
+
+  console.log("   ConfigShare tests passed!");
+}
+
+async function runAll() {
   testMD5();
   testFilter();
   testPlannerLWW();
+  await testConfigShare();
   console.log("🎉 All unit tests passed successfully!");
 }
 
-runAll();
+runAll().catch((err) => {
+  console.error("Test execution failed:", err);
+  process.exit(1);
+});

@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type BaiduSyncPlugin from "../main";
+import { ExportConfigModal, ImportConfigModal } from "../ui/configShareModal";
 
 export class BaiduSyncSettingTab extends PluginSettingTab {
   plugin: BaiduSyncPlugin;
@@ -118,8 +119,38 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           })
       );
 
-    // Section 2: Storage Path
-    new Setting(containerEl).setName("2. 存储与目录规划").setHeading();
+    // Section 2: Multi-Device Quick Pairing & Config Migration
+    new Setting(containerEl).setName("2. 📱 多设备快速配对与配置迁移").setHeading();
+
+    const pairDesc = containerEl.createDiv({ cls: "setting-item-description" });
+    pairDesc.style.marginBottom = "12px";
+    pairDesc.setText(
+      "免去手机/平板端重复申请开放平台应用与繁琐授权流程。在已配置的主设备上一键导出加密配对码，在第二台设备直接导入即可秒级完成全端同步连接。"
+    );
+
+    new Setting(containerEl)
+      .setName("多设备配对管理")
+      .setDesc("通过 AES-256-GCM 密码保护的配对码在手机、平板与电脑间安全迁移授权与设置")
+      .addButton((btn) =>
+        btn
+          .setButtonText("📤 导出配置至其他设备")
+          .setCta()
+          .onClick(() => {
+            new ExportConfigModal(this.app, this.plugin).open();
+          })
+      )
+      .addButton((btn) =>
+        btn
+          .setButtonText("📥 导入外部设备配置")
+          .onClick(() => {
+            new ImportConfigModal(this.app, this.plugin, () => {
+              this.display();
+            }).open();
+          })
+      );
+
+    // Section 3: Storage Path
+    new Setting(containerEl).setName("3. 存储与目录规划").setHeading();
 
     new Setting(containerEl)
       .setName("网盘端根目录")
@@ -134,8 +165,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           })
       );
 
-    // Section 3: Scope and Filtering
-    new Setting(containerEl).setName("3. 配置同步与文件过滤").setHeading();
+    // Section 4: Scope and Filtering
+    new Setting(containerEl).setName("4. 配置同步与文件过滤").setHeading();
 
     const configDirName = this.app.vault.configDir;
     new Setting(containerEl)
@@ -188,8 +219,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           });
       });
 
-    // Section 4: Trigger Settings
-    new Setting(containerEl).setName("4. 同步触发机制").setHeading();
+    // Section 5: Trigger Settings
+    new Setting(containerEl).setName("5. 同步触发机制").setHeading();
 
     new Setting(containerEl)
       .setName("启动时自动同步")
@@ -230,8 +261,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           })
       );
 
-    // Section 5: Concurrency & Performance
-    new Setting(containerEl).setName("5. 传输调度与网络并发").setHeading();
+    // Section 6: Concurrency & Performance
+    new Setting(containerEl).setName("6. 传输调度与网络并发").setHeading();
 
     new Setting(containerEl)
       .setName("并发传输请求数 (1~5)")
@@ -246,8 +277,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           })
       );
 
-    // Section 6: End-to-End Encryption
-    new Setting(containerEl).setName("6. 端到端隐私加密 (E2EE)").setHeading();
+    // Section 7: End-to-End Encryption
+    new Setting(containerEl).setName("7. 端到端隐私加密 (E2EE)").setHeading();
 
     new Setting(containerEl)
       .setName("开启 AES-256-GCM 端到端加密")

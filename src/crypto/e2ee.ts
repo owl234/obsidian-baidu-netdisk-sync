@@ -5,7 +5,7 @@
  */
 
 const MAGIC_HEADER = new Uint8Array([0x42, 0x44, 0x53, 0x59, 0x4e, 0x43, 0x5f, 0x45, 0x32, 0x45, 0x45, 0x01]); // "BDSYNC_E2EE\x01"
-const PBKDF2_ITERATIONS = 100000;
+const PBKDF2_ITERATIONS = 600000;
 
 export function isEncrypted(buffer: ArrayBuffer): boolean {
   if (buffer.byteLength < MAGIC_HEADER.length + 16 + 12 + 16) {
@@ -20,9 +20,20 @@ export function isEncrypted(buffer: ArrayBuffer): boolean {
   return true;
 }
 
+function getCrypto(): Crypto {
+  if (typeof window !== "undefined" && window.crypto) {
+    return window.crypto;
+  }
+  if (typeof globalThis !== "undefined" && (globalThis as any).crypto) {
+    return (globalThis as any).crypto;
+  }
+  throw new Error("Web Crypto API is not available.");
+}
+
 async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
   const enc = new TextEncoder();
-  const keyMaterial = await window.crypto.subtle.importKey(
+  const crypto = getCrypto();
+  const keyMaterial = await crypto.subtle.importKey(
     "raw",
     enc.encode(password),
     { name: "PBKDF2" },
@@ -30,7 +41,7 @@ async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey>
     ["deriveKey"]
   );
 
-  return window.crypto.subtle.deriveKey(
+  return crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
       salt: salt,
@@ -45,11 +56,12 @@ async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey>
 }
 
 export async function encryptData(data: ArrayBuffer, password: string): Promise<ArrayBuffer> {
-  const salt = window.crypto.getRandomValues(new Uint8Array(16));
-  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const crypto = getCrypto();
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await deriveKey(password, salt);
 
-  const ciphertext = await window.crypto.subtle.encrypt(
+  const ciphertext = await crypto.subtle.encrypt(
     {
       name: "AES-GCM",
       iv: iv
@@ -93,7 +105,8 @@ export async function decryptData(encryptedBuffer: ArrayBuffer, password: string
   const key = await deriveKey(password, salt);
 
   try {
-    return await window.crypto.subtle.decrypt(
+    const crypto = getCrypto();
+    return await crypto.subtle.decrypt(
       {
         name: "AES-GCM",
         iv: iv
