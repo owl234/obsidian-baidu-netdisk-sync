@@ -1,5 +1,5 @@
 {
-  "name": "baidu-netdisk-sync",
+  "name": "obsidian-baidu-netdisk-sync",
   "version": "1.0.6",
   "description": "Cross-platform bi-directional synchronization with Baidu Netdisk for your vaults.",
   "main": "main.js",
