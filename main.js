@@ -428,7 +428,17 @@ var BaiduSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
   }
+  /**
+   * Declarative settings definition interface for Obsidian 1.13.0+ search.
+   * Returning an empty array allows backward/forward-compatible fallback to display().
+   */
+  getSettingDefinitions() {
+    return [];
+  }
   display() {
+    this.renderSettings();
+  }
+  renderSettings() {
     const { containerEl } = this;
     containerEl.empty();
     new import_obsidian2.Setting(containerEl).setName("\u767E\u5EA6\u7F51\u76D8\u540C\u6B65\u8BBE\u7F6E").setHeading();
@@ -490,7 +500,7 @@ var BaiduSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
           btn.setButtonText("\u6B63\u5728\u6362\u53D6...");
           await this.plugin.oauth.exchangeCodeForToken(authCodeInput);
           new import_obsidian2.Notice("\u{1F389} \u767E\u5EA6\u7F51\u76D8\u8D26\u53F7\u7ED1\u5B9A\u6210\u529F\uFF01");
-          this.display();
+          this.renderSettings();
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           new import_obsidian2.Notice(`\u7ED1\u5B9A\u5931\u8D25: ${msg}`);
@@ -514,7 +524,7 @@ var BaiduSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
     ).addButton(
       (btn) => btn.setButtonText("\u{1F4E5} \u5BFC\u5165\u5916\u90E8\u8BBE\u5907\u914D\u7F6E").onClick(() => {
         new ImportConfigModal(this.app, this.plugin, () => {
-          this.display();
+          this.renderSettings();
         }).open();
       })
     );

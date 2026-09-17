@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting, Notice } from "obsidian";
+import { App, PluginSettingTab, Setting, Notice, SettingDefinitionItem } from "obsidian";
 import type BaiduSyncPlugin from "../main";
 import { ExportConfigModal, ImportConfigModal } from "../ui/configShareModal";
 
@@ -10,7 +10,19 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  /**
+   * Declarative settings definition interface for Obsidian 1.13.0+ search.
+   * Returning an empty array allows backward/forward-compatible fallback to display().
+   */
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [];
+  }
+
   display(): void {
+    this.renderSettings();
+  }
+
+  private renderSettings(): void {
     const { containerEl } = this;
     containerEl.empty();
 
@@ -108,7 +120,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
               btn.setButtonText("正在换取...");
               await this.plugin.oauth.exchangeCodeForToken(authCodeInput);
               new Notice("🎉 百度网盘账号绑定成功！");
-              this.display(); // Refresh tab view
+              this.renderSettings(); // Refresh tab view
             } catch (err: unknown) {
               const msg = err instanceof Error ? err.message : String(err);
               new Notice(`绑定失败: ${msg}`);
@@ -145,7 +157,7 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           .setButtonText("📥 导入外部设备配置")
           .onClick(() => {
             new ImportConfigModal(this.app, this.plugin, () => {
-              this.display();
+              this.renderSettings();
             }).open();
           })
       );
