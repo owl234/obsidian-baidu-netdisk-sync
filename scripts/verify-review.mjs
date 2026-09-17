@@ -3,7 +3,7 @@
 /**
  * Obsidian Community Plugin Review Verifier
  * Reads credentials from .env or process.env, queries the Obsidian plugin portal,
- * and prints an audit report for the latest (or specified) plugin release.
+ * and prints an audit report for the latest release and branch reviews.
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -36,6 +36,17 @@ function loadEnv() {
 
 loadEnv();
 
+// Read local manifest.json
+let localManifest = { version: 'Unknown', id: 'baidu-netdisk-sync' };
+try {
+  const manifestPath = resolve(rootDir, 'manifest.json');
+  if (existsSync(manifestPath)) {
+    localManifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+  }
+} catch {
+  // ignore
+}
+
 const PLUGIN_URL = process.env.OBS_PLUGIN_URL || 'https://community.obsidian.md/account/plugins/baidu-netdisk-sync';
 const OBS_TOKEN = process.env.OBS_TOKEN;
 const OBS_STRIPE_MID = process.env.OBS_STRIPE_MID;
@@ -54,6 +65,26 @@ const colors = {
   bgGreen: '\x1b[42m',
 };
 
+async function triggerCheckRelease(cookies) {
+  const checkUrl = `${PLUGIN_URL}/check-release`;
+  try {
+    const res = await fetch(checkUrl, {
+      headers: {
+        'Cookie': cookies.join('; '),
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+    });
+    const text = await res.text();
+    if (text.includes('This entry was refreshed in the last few minutes')) {
+      console.log(`${colors.dim}ℹ️  Check-release triggered (rate-limit cooldown active).${colors.reset}`);
+    } else {
+      console.log(`${colors.dim}ℹ️  Check-release triggered successfully.${colors.reset}`);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function main() {
   if (!OBS_TOKEN) {
     console.error(`${colors.red}❌ Error: OBS_TOKEN is not set.${colors.reset}`);
@@ -62,12 +93,18 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`${colors.cyan}${colors.bold}🔍 Checking Obsidian Community Plugin Review Status...${colors.reset}`);
-  console.log(`${colors.dim}Target URL: ${PLUGIN_URL}${colors.reset}\n`);
-
   const cookies = [];
   if (OBS_STRIPE_MID) cookies.push(`__stripe_mid=${OBS_STRIPE_MID}`);
   cookies.push(`obs_token=${OBS_TOKEN}`);
+
+  // If --check or --refresh flag is passed, trigger release check first
+  if (process.argv.includes('--check') || process.argv.includes('--refresh')) {
+    await triggerCheckRelease(cookies);
+  }
+
+  console.log(`${colors.cyan}${colors.bold}🔍 Checking Obsidian Community Plugin Review Status...${colors.reset}`);
+  console.log(`${colors.dim}Target URL: ${PLUGIN_URL}${colors.reset}`);
+  console.log(`${colors.dim}Local Target Version: ${localManifest.version}${colors.reset}\n`);
 
   let html;
   try {
@@ -109,42 +146,60 @@ async function main() {
     fullPayload = html;
   }
 
-  // Parse latest audit run
-  const runMatches = [...fullPayload.matchAll(/Commit.*?"children":"([a-f0-9]{7,})".*?"children":"(Completed|Failed|Passed|Pending|Approved)"/gs)];
-  
-  let latestVersion = 'Unknown';
-  let latestCommit = 'Unknown';
-  let overallStatus = 'Unknown';
-  let latestSlice = fullPayload;
-
-  if (runMatches.length > 0) {
-    const firstRun = runMatches[0];
-    latestCommit = firstRun[1];
-    overallStatus = firstRun[2];
-
-    const startPos = firstRun.index;
-    const endPos = runMatches.length > 1 ? runMatches[1].index : fullPayload.length;
-    latestSlice = fullPayload.slice(startPos, endPos);
-
-    const sliceBefore = fullPayload.slice(Math.max(0, startPos - 400), startPos);
-    const verMatch = sliceBefore.match(/Version.*?"children":"([^"]+)"/);
-    const refMatch = sliceBefore.match(/Ref.*?"children":"([^"]+)"/);
-    if (verMatch) {
-      latestVersion = verMatch[1];
-    } else if (refMatch) {
-      latestVersion = refMatch[1];
-    }
-  } else {
-    const verMatch = fullPayload.match(/Version.*?(\d+\.\d+\.\d+)/);
-    if (verMatch) latestVersion = verMatch[1];
-    const statusMatch = fullPayload.match(/(Completed|Failed|Passed|Approved|Pending)/);
-    if (statusMatch) overallStatus = statusMatch[1];
+  // 1. Check Top-Level Red Alert Banners
+  const criticalBanners = [];
+  if (fullPayload.includes('No release matches your manifest version')) {
+    const msgMatch = fullPayload.match(/No release matches your manifest version.*?children":"([^"]+)"/);
+    const detail = msgMatch ? msgMatch[1] : "Your manifest.json points at a version that doesn't have a matching GitHub release.";
+    criticalBanners.push({
+      title: 'No release matches your manifest version',
+      detail,
+    });
+  }
+  if (fullPayload.includes('The latest release of this entry failed one or more automated checks')) {
+    criticalBanners.push({
+      title: 'Latest Release Failed Automated Checks',
+      detail: 'The latest release of this entry failed one or more automated checks in the Obsidian review portal.',
+    });
   }
 
-  // Extract markdown issue blocks for the latest run
+  // 2. Parse All Audit Runs (distinguishing Release vs Branch/Preview)
+  const runMatches = [...fullPayload.matchAll(/(?:Version|Ref).*?"children":"([^"]+)".*?Commit.*?"children":"([a-f0-9]{7,})".*?"children":"(Completed|Failed|Passed|Pending|Approved)"/gs)];
+  
+  const allRuns = [];
+  for (let i = 0; i < runMatches.length; i++) {
+    const r = runMatches[i];
+    const isVersion = fullPayload.slice(Math.max(0, r.index - 30), r.index + 20).includes('Version');
+    const label = r[1];
+    const commit = r[2];
+    const status = r[3];
+    const startPos = r.index;
+    const endPos = i + 1 < runMatches.length ? runMatches[i + 1].index : fullPayload.length;
+    const slice = fullPayload.slice(startPos, endPos);
+
+    allRuns.push({
+      isRelease: isVersion,
+      label,
+      commit,
+      status,
+      slice,
+    });
+  }
+
+  // Find target release run (or latest release run)
+  const releaseRuns = allRuns.filter(r => r.isRelease);
+  const previewRuns = allRuns.filter(r => !r.isRelease);
+
+  const matchedRelease = releaseRuns.find(r => r.label === localManifest.version) || releaseRuns[0];
+  const latestPreview = previewRuns[0];
+
+  // Parse markdown issues from the matched release run (or fallback to latest preview)
+  const targetRun = matchedRelease || latestPreview;
+  const targetSlice = targetRun ? targetRun.slice : fullPayload;
+
   const mdRegex = /"markdown":"(.*?)"/g;
   const rawBlocks = [];
-  while ((match = mdRegex.exec(latestSlice)) !== null) {
+  while ((match = mdRegex.exec(targetSlice)) !== null) {
     try {
       const decoded = JSON.parse(`"${match[1]}"`);
       rawBlocks.push(decoded);
@@ -154,13 +209,12 @@ async function main() {
   }
 
   // Extract referenced RSC template strings (e.g. $47 -> 47:T...,)
-  const referencedIds = [...latestSlice.matchAll(/\$([a-f0-9]{1,4})\b/g)].map(m => m[1]);
+  const referencedIds = [...targetSlice.matchAll(/\$([a-f0-9]{1,4})\b/g)].map(m => m[1]);
   for (const refId of referencedIds) {
     const refPat = new RegExp(`${refId}:T[a-f0-9]+,(.*?)(?=\\n\\w+:|$)`, 's');
     const refMatch = fullPayload.match(refPat);
     if (refMatch) {
       let text = refMatch[1];
-      // Truncate at next component payload boundary e.g. 3c:[ or \d+[a-z]?:
       const jsonBoundary = text.search(/\d+[a-z0-9]?:\[/);
       if (jsonBoundary !== -1) {
         text = text.slice(0, jsonBoundary);
@@ -232,22 +286,42 @@ async function main() {
   // Print Summary Header
   console.log('='.repeat(65));
   console.log(`${colors.bold}📦 Plugin:${colors.reset} baidu-netdisk-sync`);
-  console.log(`${colors.bold}🔖 Latest Audited Version:${colors.reset} ${latestVersion} (${latestCommit})`);
-  
-  let statusBadge = overallStatus;
-  if (overallStatus === 'Passed' || overallStatus === 'Approved' || overallStatus === 'Completed') {
-    statusBadge = `${colors.bgGreen}${colors.bold} ${overallStatus.toUpperCase()} ${colors.reset}`;
-  } else if (overallStatus === 'Failed') {
-    statusBadge = `${colors.bgRed}${colors.bold} ${overallStatus.toUpperCase()} ${colors.reset}`;
+  console.log(`${colors.bold}🎯 Local Manifest Version:${colors.reset} ${localManifest.version}`);
+
+  if (matchedRelease) {
+    console.log(`${colors.bold}🔖 Latest Scanned Release:${colors.reset} ${matchedRelease.label} (${matchedRelease.commit}) -> ${matchedRelease.status}`);
   } else {
-    statusBadge = `${colors.yellow}${colors.bold} ${overallStatus.toUpperCase()} ${colors.reset}`;
+    console.log(`${colors.bold}🔖 Latest Scanned Release:${colors.reset} ${colors.yellow}None found in portal${colors.reset}`);
   }
-  console.log(`${colors.bold}🚦 Review Status:${colors.reset} ${statusBadge}`);
+
+  if (latestPreview) {
+    console.log(`${colors.bold}🌿 Branch Preview Review:${colors.reset} ${latestPreview.label} (${latestPreview.commit}) -> ${latestPreview.status}`);
+  }
+
+  let finalStatus = targetRun ? targetRun.status : 'Unknown';
+  let statusBadge = finalStatus;
+  if (finalStatus === 'Passed' || finalStatus === 'Approved' || finalStatus === 'Completed') {
+    statusBadge = `${colors.bgGreen}${colors.bold} ${finalStatus.toUpperCase()} ${colors.reset}`;
+  } else if (finalStatus === 'Failed') {
+    statusBadge = `${colors.bgRed}${colors.bold} ${finalStatus.toUpperCase()} ${colors.reset}`;
+  } else {
+    statusBadge = `${colors.yellow}${colors.bold} ${finalStatus.toUpperCase()} ${colors.reset}`;
+  }
+  console.log(`${colors.bold}🚦 Target Run Status:${colors.reset} ${statusBadge}`);
   console.log('='.repeat(65));
+
+  // Print Critical Alert Banners
+  if (criticalBanners.length > 0) {
+    console.log(`\n${colors.red}${colors.bold}🛑 CRITICAL REPOSITORY BANNERS (${criticalBanners.length}):${colors.reset}`);
+    for (const b of criticalBanners) {
+      console.log(`  ${colors.red}• ${b.title}${colors.reset}`);
+      console.log(`    ${colors.dim}${b.detail}${colors.reset}`);
+    }
+  }
 
   // Print Errors
   if (categories.errors.length > 0) {
-    console.log(`\n${colors.red}${colors.bold}🚨 ERRORS (${categories.errors.length}) - MUST FIX FOR APPROVAL:${colors.reset}`);
+    console.log(`\n${colors.red}${colors.bold}🚨 AUDIT ERRORS (${categories.errors.length}) - MUST FIX FOR APPROVAL:${colors.reset}`);
     for (const err of categories.errors) {
       console.log(`  ${colors.red}• ${err.text.replace(/^-\s*/, '')}${colors.reset}`);
       for (const d of err.details) {
@@ -267,17 +341,6 @@ async function main() {
     }
   }
 
-  // Print Recommendations
-  if (categories.recommendations.length > 0) {
-    console.log(`\n${colors.blue}${colors.bold}💡 RECOMMENDATIONS (${categories.recommendations.length}):${colors.reset}`);
-    for (const rec of categories.recommendations) {
-      console.log(`  ${colors.blue}• ${rec.text.replace(/^-\s*/, '')}${colors.reset}`);
-      for (const d of rec.details) {
-        console.log(`    ${colors.dim}${d}${colors.reset}`);
-      }
-    }
-  }
-
   // Print Passes
   if (categories.passes.length > 0) {
     console.log(`\n${colors.green}${colors.bold}✅ PASSED AUDITS (${categories.passes.length}):${colors.reset}`);
@@ -288,11 +351,13 @@ async function main() {
 
   console.log('\n' + '='.repeat(65));
 
-  if (overallStatus === 'Failed' || categories.errors.length > 0) {
-    console.log(`${colors.red}❌ Verification Failed: Release contains errors that violate Obsidian guidelines.${colors.reset}\n`);
+  const hasCriticalFailure = criticalBanners.length > 0 || categories.errors.length > 0 || finalStatus === 'Failed';
+
+  if (hasCriticalFailure) {
+    console.log(`${colors.red}❌ Verification Failed: Action required before community distribution can succeed.${colors.reset}\n`);
     process.exit(1);
   } else {
-    console.log(`${colors.green}✨ Verification Succeeded: All critical checks passed!${colors.reset}\n`);
+    console.log(`${colors.green}✨ Verification Succeeded: All checks passed!${colors.reset}\n`);
     process.exit(0);
   }
 }

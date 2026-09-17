@@ -87,11 +87,14 @@ npm run build
 2. [`manifest.json`](file:///Users/sienchen/Documents/github_project/obsidian-baidu-netdisk-sync/manifest.json) -> `version`
 
 ### 步骤 3：提交与 Tag 推送
+> ⚠️ **重要规则：严禁带 `v` 前缀**！Obsidian 官方社区插件发布平台与安装分发器强制要求：GitHub Release Tag 必须与 `manifest.json` 中的 `version` **完全精确一致**（如 `1.0.11`，绝对不能使用 `v1.0.11`）。若带 `v` 前缀，官方审核平台会提示 `No release matches your manifest version` 并拒绝扫描与分发。
+
 ```bash
 git add .
-git commit -m "chore(release): vX.Y.Z"
-git tag vX.Y.Z
-git push origin main --tags
+git commit -m "chore(release): X.Y.Z"
+git tag X.Y.Z
+git push origin main
+git push origin X.Y.Z
 ```
 GitHub Actions ([`.github/workflows/release.yml`](file:///Users/sienchen/Documents/github_project/obsidian-baidu-netdisk-sync/.github/workflows/release.yml)) 会自动构建产物、生成 GitHub Attestation 并创建 Release。
 
