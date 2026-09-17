@@ -24,8 +24,12 @@ function getCrypto(): Crypto {
   if (typeof window !== "undefined" && window.crypto) {
     return window.crypto;
   }
-  if (typeof globalThis !== "undefined" && (globalThis as any).crypto) {
-    return (globalThis as any).crypto;
+  if (typeof activeWindow !== "undefined" && (activeWindow as Window)?.crypto) {
+    return (activeWindow as Window).crypto;
+  }
+  const fallbackCrypto = typeof global !== "undefined" ? (global as unknown as { crypto?: Crypto }).crypto : undefined;
+  if (fallbackCrypto) {
+    return fallbackCrypto;
   }
   throw new Error("Web Crypto API is not available.");
 }

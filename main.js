@@ -83,8 +83,12 @@ function getCrypto() {
   if (typeof window !== "undefined" && window.crypto) {
     return window.crypto;
   }
-  if (typeof globalThis !== "undefined" && globalThis.crypto) {
-    return globalThis.crypto;
+  if (typeof activeWindow !== "undefined" && activeWindow?.crypto) {
+    return activeWindow.crypto;
+  }
+  const fallbackCrypto = typeof global !== "undefined" ? global.crypto : void 0;
+  if (fallbackCrypto) {
+    return fallbackCrypto;
   }
   throw new Error("Web Crypto API is not available.");
 }
@@ -240,7 +244,7 @@ async function importEncryptedConfig(pairingCode, pin) {
   let decryptedBuf;
   try {
     decryptedBuf = await decryptData(encryptedBytes.buffer, pin.trim());
-  } catch (err) {
+  } catch {
     throw new Error("\u914D\u5BF9\u7801\u89E3\u5BC6\u5931\u8D25\uFF01\u8BF7\u786E\u8BA4\u914D\u5BF9\u4FDD\u62A4\u5BC6\u7801\u662F\u5426\u4E0E\u5BFC\u51FA\u65F6\u4E00\u81F4\u3002");
   }
   const dec = new TextDecoder();
@@ -269,9 +273,9 @@ var ExportConfigModal = class extends import_obsidian.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "\u{1F4F1} \u5BFC\u51FA\u591A\u8BBE\u5907\u540C\u6B65\u914D\u7F6E" });
-    const desc = contentEl.createDiv({ cls: "setting-item-description" });
-    desc.style.marginBottom = "16px";
-    desc.style.lineHeight = "1.6";
+    const desc = contentEl.createDiv({
+      cls: "setting-item-description baidu-sync-modal-desc"
+    });
     desc.setText(
       "\u6B64\u529F\u80FD\u5C06\u751F\u6210\u9AD8\u5F3A\u5EA6 AES-256-GCM \u52A0\u5BC6\u7684\u914D\u5BF9\u7801\uFF08\u5305\u542B\u7F51\u76D8\u6388\u6743 Token \u53CA\u540C\u6B65\u914D\u7F6E\uFF09\u3002\u5C06\u914D\u5BF9\u7801\u53D1\u9001\u81F3\u624B\u673A\u3001\u5E73\u677F\u6216\u5176\u4ED6\u7535\u8111\uFF0C\u5373\u53EF\u514D\u53BB\u91CD\u590D\u7533\u8BF7\u5F00\u53D1\u8005\u8D26\u53F7\u4E0E\u7E41\u7410\u6388\u6743\uFF0C\u4E00\u952E\u5B8C\u6210\u591A\u7AEF\u7EC4\u7F51\u3002"
     );
@@ -300,19 +304,20 @@ var ExportConfigModal = class extends import_obsidian.Modal {
         }
         try {
           btn.setDisabled(true);
-          this.generatedCode = await exportEncryptedConfig(this.plugin.settings, this.pin);
+          new import_obsidian.Notice("\u6B63\u5728\u751F\u6210\u52A0\u5BC6\u914D\u5BF9\u7801...");
+          const code = await exportEncryptedConfig(this.plugin.settings, this.pin);
+          this.generatedCode = code;
           if (codeAreaEl) {
-            codeAreaEl.value = this.generatedCode;
+            codeAreaEl.value = code;
           }
           if (copyBtnEl) {
             copyBtnEl.disabled = false;
           }
           try {
-            await navigator.clipboard.writeText(this.generatedCode);
-            new import_obsidian.Notice("\u2705 \u914D\u5BF9\u7801\u5DF2\u751F\u6210\u5E76\u81EA\u52A8\u590D\u5236\u5230\u526A\u8D34\u677F\uFF01");
+            await navigator.clipboard.writeText(code);
+            new import_obsidian.Notice("\u2705 \u52A0\u5BC6\u914D\u5BF9\u7801\u5DF2\u751F\u6210\u5E76\u81EA\u52A8\u590D\u5236\u5230\u526A\u8D34\u677F\uFF01");
           } catch {
-            codeAreaEl?.select();
-            new import_obsidian.Notice("\u2705 \u914D\u5BF9\u7801\u5DF2\u751F\u6210\uFF01(\u56E0\u7CFB\u7EDF\u9650\u5236\u81EA\u52A8\u590D\u5236\u53D7\u963B\uFF0C\u8BF7\u957F\u6309\u4E0B\u65B9\u6587\u672C\u6846\u624B\u52A8\u590D\u5236)");
+            new import_obsidian.Notice("\u2705 \u52A0\u5BC6\u914D\u5BF9\u7801\u5DF2\u751F\u6210\uFF0C\u8BF7\u5728\u4E0B\u65B9\u6587\u672C\u6846\u624B\u52A8\u590D\u5236\uFF01");
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -323,15 +328,8 @@ var ExportConfigModal = class extends import_obsidian.Modal {
       });
     });
     const outputContainer = contentEl.createDiv({ cls: "baidu-sync-export-output" });
-    outputContainer.style.marginTop = "16px";
-    const textarea = outputContainer.createEl("textarea");
+    const textarea = outputContainer.createEl("textarea", { cls: "baidu-sync-code-area" });
     textarea.rows = 5;
-    textarea.style.width = "100%";
-    textarea.style.fontFamily = "monospace";
-    textarea.style.fontSize = "12px";
-    textarea.style.resize = "vertical";
-    textarea.style.wordBreak = "break-all";
-    textarea.style.whiteSpace = "pre-wrap";
     textarea.placeholder = "\u70B9\u51FB\u4E0A\u65B9\u201C\u751F\u6210\u52A0\u5BC6\u914D\u5BF9\u7801\u201D\u540E\uFF0C\u914D\u5BF9\u5B57\u7B26\u4E32\u5C06\u663E\u793A\u5728\u6B64\u5904...";
     textarea.readOnly = true;
     codeAreaEl = textarea;
@@ -367,19 +365,15 @@ var ImportConfigModal = class extends import_obsidian.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "\u{1F4F2} \u5BFC\u5165\u591A\u8BBE\u5907\u540C\u6B65\u914D\u7F6E" });
-    const desc = contentEl.createDiv({ cls: "setting-item-description" });
-    desc.style.marginBottom = "16px";
-    desc.style.lineHeight = "1.6";
+    const desc = contentEl.createDiv({
+      cls: "setting-item-description baidu-sync-modal-desc"
+    });
     desc.setText(
       "\u7C98\u8D34\u4ECE\u5DF2\u914D\u7F6E\u8BBE\u5907\u5BFC\u51FA\u7684\u52A0\u5BC6\u914D\u5BF9\u7801\uFF0C\u5E76\u8F93\u5165\u5BF9\u5E94\u7684\u914D\u5BF9\u4FDD\u62A4\u5BC6\u7801\u3002\u5BFC\u5165\u540E\u5F53\u524D\u8BBE\u5907\u5C06\u81EA\u52A8\u540C\u6B65\u7F51\u76D8\u6388\u6743\u51ED\u636E\u4E0E\u540C\u6B65\u89C4\u5219\uFF0C\u65E0\u9700\u518D\u914D\u7F6E AppKey \u6216\u767B\u5F55\u7F51\u9875\u3002"
     );
     new import_obsidian.Setting(contentEl).setName("\u914D\u5BF9\u7801 (Pairing Code)").setDesc("\u7C98\u8D34\u4EE5 BDSYNC:v1: \u5F00\u5934\u7684\u52A0\u5BC6\u914D\u5BF9\u5B57\u7B26\u4E32").addTextArea((area) => {
       area.inputEl.rows = 4;
-      area.inputEl.style.width = "100%";
-      area.inputEl.style.fontFamily = "monospace";
-      area.inputEl.style.fontSize = "12px";
-      area.inputEl.style.wordBreak = "break-all";
-      area.inputEl.style.whiteSpace = "pre-wrap";
+      area.inputEl.addClass("baidu-sync-code-area");
       area.setPlaceholder("BDSYNC:v1:...");
       area.onChange((val) => {
         this.pairingCode = val.trim();
@@ -521,8 +515,9 @@ var BaiduSyncSettingTab = class extends import_obsidian2.PluginSettingTab {
       })
     );
     new import_obsidian2.Setting(containerEl).setName("2. \u{1F4F1} \u591A\u8BBE\u5907\u5FEB\u901F\u914D\u5BF9\u4E0E\u914D\u7F6E\u8FC1\u79FB").setHeading();
-    const pairDesc = containerEl.createDiv({ cls: "setting-item-description" });
-    pairDesc.style.marginBottom = "12px";
+    const pairDesc = containerEl.createDiv({
+      cls: "setting-item-description baidu-sync-setting-desc"
+    });
     pairDesc.setText(
       "\u514D\u53BB\u624B\u673A/\u5E73\u677F\u7AEF\u91CD\u590D\u7533\u8BF7\u5F00\u653E\u5E73\u53F0\u5E94\u7528\u4E0E\u7E41\u7410\u6388\u6743\u6D41\u7A0B\u3002\u5728\u5DF2\u914D\u7F6E\u7684\u4E3B\u8BBE\u5907\u4E0A\u4E00\u952E\u5BFC\u51FA\u52A0\u5BC6\u914D\u5BF9\u7801\uFF0C\u5728\u7B2C\u4E8C\u53F0\u8BBE\u5907\u76F4\u63A5\u5BFC\u5165\u5373\u53EF\u79D2\u7EA7\u5B8C\u6210\u5168\u7AEF\u540C\u6B65\u8FDE\u63A5\u3002"
     );

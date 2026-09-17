@@ -122,8 +122,9 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
     // Section 2: Multi-Device Quick Pairing & Config Migration
     new Setting(containerEl).setName("2. 📱 多设备快速配对与配置迁移").setHeading();
 
-    const pairDesc = containerEl.createDiv({ cls: "setting-item-description" });
-    pairDesc.style.marginBottom = "12px";
+    const pairDesc = containerEl.createDiv({
+      cls: "setting-item-description baidu-sync-setting-desc",
+    });
     pairDesc.setText(
       "免去手机/平板端重复申请开放平台应用与繁琐授权流程。在已配置的主设备上一键导出加密配对码，在第二台设备直接导入即可秒级完成全端同步连接。"
     );

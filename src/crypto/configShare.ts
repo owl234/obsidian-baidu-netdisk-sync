@@ -84,7 +84,7 @@ export async function exportEncryptedConfig(
 
   const jsonStr = JSON.stringify(exportPayload);
   const enc = new TextEncoder();
-  const rawData = enc.encode(jsonStr).buffer as ArrayBuffer;
+  const rawData = enc.encode(jsonStr).buffer;
 
   const encryptedBuf = await encryptData(rawData, pin.trim());
   const b64 = uint8ArrayToBase64(new Uint8Array(encryptedBuf));
@@ -111,20 +111,20 @@ export async function importEncryptedConfig(
   const encryptedBytes = base64ToUint8Array(base64Part);
 
   // Enforce cryptographic magic header check to prevent plaintext downgrade / PIN bypass attacks
-  if (!isEncrypted(encryptedBytes.buffer as ArrayBuffer)) {
+  if (!isEncrypted(encryptedBytes.buffer)) {
     throw new Error("非法配对码：数据未经过加密保护，已被系统拒绝！");
   }
 
   let decryptedBuf: ArrayBuffer;
   try {
-    decryptedBuf = await decryptData(encryptedBytes.buffer as ArrayBuffer, pin.trim());
-  } catch (err) {
+    decryptedBuf = await decryptData(encryptedBytes.buffer, pin.trim());
+  } catch {
     throw new Error("配对码解密失败！请确认配对保护密码是否与导出时一致。");
   }
 
   const dec = new TextDecoder();
   const jsonStr = dec.decode(decryptedBuf);
-  let parsed: any;
+  let parsed: unknown;
   try {
     parsed = JSON.parse(jsonStr);
   } catch {

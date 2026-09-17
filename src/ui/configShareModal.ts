@@ -18,9 +18,9 @@ export class ExportConfigModal extends Modal {
 
     contentEl.createEl("h2", { text: "📱 导出多设备同步配置" });
 
-    const desc = contentEl.createDiv({ cls: "setting-item-description" });
-    desc.style.marginBottom = "16px";
-    desc.style.lineHeight = "1.6";
+    const desc = contentEl.createDiv({
+      cls: "setting-item-description baidu-sync-modal-desc",
+    });
     desc.setText(
       "此功能将生成高强度 AES-256-GCM 加密的配对码（包含网盘授权 Token 及同步配置）。将配对码发送至手机、平板或其他电脑，即可免去重复申请开发者账号与繁琐授权，一键完成多端组网。"
     );
@@ -60,23 +60,24 @@ export class ExportConfigModal extends Modal {
 
             try {
               btn.setDisabled(true);
-              this.generatedCode = await exportEncryptedConfig(this.plugin.settings, this.pin);
+              new Notice("正在生成加密配对码...");
+              const code = await exportEncryptedConfig(this.plugin.settings, this.pin);
+              this.generatedCode = code;
+
               if (codeAreaEl) {
-                codeAreaEl.value = this.generatedCode;
+                codeAreaEl.value = code;
               }
               if (copyBtnEl) {
                 copyBtnEl.disabled = false;
               }
 
-              // Isolated clipboard write with graceful fallback for mobile WebViews
               try {
-                await navigator.clipboard.writeText(this.generatedCode);
-                new Notice("✅ 配对码已生成并自动复制到剪贴板！");
+                await navigator.clipboard.writeText(code);
+                new Notice("✅ 加密配对码已生成并自动复制到剪贴板！");
               } catch {
-                codeAreaEl?.select();
-                new Notice("✅ 配对码已生成！(因系统限制自动复制受阻，请长按下方文本框手动复制)");
+                new Notice("✅ 加密配对码已生成，请在下方文本框手动复制！");
               }
-            } catch (err: unknown) {
+            } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               new Notice(`生成失败: ${msg}`);
             } finally {
@@ -86,16 +87,9 @@ export class ExportConfigModal extends Modal {
       });
 
     const outputContainer = contentEl.createDiv({ cls: "baidu-sync-export-output" });
-    outputContainer.style.marginTop = "16px";
 
-    const textarea = outputContainer.createEl("textarea");
+    const textarea = outputContainer.createEl("textarea", { cls: "baidu-sync-code-area" });
     textarea.rows = 5;
-    textarea.style.width = "100%";
-    textarea.style.fontFamily = "monospace";
-    textarea.style.fontSize = "12px";
-    textarea.style.resize = "vertical";
-    textarea.style.wordBreak = "break-all";
-    textarea.style.whiteSpace = "pre-wrap";
     textarea.placeholder = "点击上方“生成加密配对码”后，配对字符串将显示在此处...";
     textarea.readOnly = true;
     codeAreaEl = textarea;
@@ -141,9 +135,9 @@ export class ImportConfigModal extends Modal {
 
     contentEl.createEl("h2", { text: "📲 导入多设备同步配置" });
 
-    const desc = contentEl.createDiv({ cls: "setting-item-description" });
-    desc.style.marginBottom = "16px";
-    desc.style.lineHeight = "1.6";
+    const desc = contentEl.createDiv({
+      cls: "setting-item-description baidu-sync-modal-desc",
+    });
     desc.setText(
       "粘贴从已配置设备导出的加密配对码，并输入对应的配对保护密码。导入后当前设备将自动同步网盘授权凭据与同步规则，无需再配置 AppKey 或登录网页。"
     );
@@ -153,11 +147,7 @@ export class ImportConfigModal extends Modal {
       .setDesc("粘贴以 BDSYNC:v1: 开头的加密配对字符串")
       .addTextArea((area) => {
         area.inputEl.rows = 4;
-        area.inputEl.style.width = "100%";
-        area.inputEl.style.fontFamily = "monospace";
-        area.inputEl.style.fontSize = "12px";
-        area.inputEl.style.wordBreak = "break-all";
-        area.inputEl.style.whiteSpace = "pre-wrap";
+        area.inputEl.addClass("baidu-sync-code-area");
         area.setPlaceholder("BDSYNC:v1:...");
         area.onChange((val) => {
           this.pairingCode = val.trim();

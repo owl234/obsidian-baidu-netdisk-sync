@@ -60,3 +60,25 @@
     width: 100%;
     min-height: 120px;
 }
+
+.baidu-sync-modal-desc {
+    margin-bottom: 16px;
+    line-height: 1.6;
+}
+
+.baidu-sync-setting-desc {
+    margin-bottom: 12px;
+}
+
+.baidu-sync-export-output {
+    margin-top: 16px;
+}
+
+.baidu-sync-code-area {
+    width: 100%;
+    font-family: var(--font-monospace);
+    font-size: 12px;
+    resize: vertical;
+    word-break: break-all;
+    white-space: pre-wrap;
+}
