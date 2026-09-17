@@ -80,29 +80,25 @@ function isEncrypted(buffer) {
   return true;
 }
 function getCrypto() {
+  if (typeof activeWindow !== "undefined" && activeWindow.crypto) {
+    return activeWindow.crypto;
+  }
   if (typeof window !== "undefined" && window.crypto) {
     return window.crypto;
   }
-  if (typeof activeWindow !== "undefined" && activeWindow?.crypto) {
-    return activeWindow.crypto;
-  }
-  const fallbackCrypto = typeof global !== "undefined" ? global.crypto : void 0;
-  if (fallbackCrypto) {
-    return fallbackCrypto;
-  }
-  throw new Error("Web Crypto API is not available.");
+  return crypto;
 }
 async function deriveKey(password, salt) {
   const enc = new TextEncoder();
-  const crypto = getCrypto();
-  const keyMaterial = await crypto.subtle.importKey(
+  const crypto2 = getCrypto();
+  const keyMaterial = await crypto2.subtle.importKey(
     "raw",
     enc.encode(password),
     { name: "PBKDF2" },
     false,
     ["deriveKey"]
   );
-  return crypto.subtle.deriveKey(
+  return crypto2.subtle.deriveKey(
     {
       name: "PBKDF2",
       salt,
@@ -116,11 +112,11 @@ async function deriveKey(password, salt) {
   );
 }
 async function encryptData(data, password) {
-  const crypto = getCrypto();
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const crypto2 = getCrypto();
+  const salt = crypto2.getRandomValues(new Uint8Array(16));
+  const iv = crypto2.getRandomValues(new Uint8Array(12));
   const key = await deriveKey(password, salt);
-  const ciphertext = await crypto.subtle.encrypt(
+  const ciphertext = await crypto2.subtle.encrypt(
     {
       name: "AES-GCM",
       iv
@@ -152,8 +148,8 @@ async function decryptData(encryptedBuffer, password) {
   const ciphertext = encryptedBuffer.slice(offset);
   const key = await deriveKey(password, salt);
   try {
-    const crypto = getCrypto();
-    return await crypto.subtle.decrypt(
+    const crypto2 = getCrypto();
+    return await crypto2.subtle.decrypt(
       {
         name: "AES-GCM",
         iv
@@ -176,31 +172,21 @@ function uint8ArrayToBase64(bytes) {
     const chunk = Array.from(bytes.subarray(i, Math.min(i + chunkSize, len)));
     binary += String.fromCharCode.apply(null, chunk);
   }
-  if (typeof btoa !== "undefined") {
-    return btoa(binary);
-  } else if (typeof Buffer !== "undefined") {
-    return Buffer.from(bytes).toString("base64");
-  }
-  throw new Error("No Base64 encoder available in current runtime.");
+  return btoa(binary);
 }
 function base64ToUint8Array(base64) {
   const clean = base64.trim();
   try {
-    if (typeof atob !== "undefined") {
-      const binary = atob(clean);
-      const len = binary.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      return bytes;
-    } else if (typeof Buffer !== "undefined") {
-      return new Uint8Array(Buffer.from(clean, "base64"));
+    const binary = atob(clean);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
     }
+    return bytes;
   } catch {
     throw new Error("\u914D\u5BF9\u7801\u683C\u5F0F\u65E0\u6548\uFF08Base64\u89E3\u6790\u5931\u8D25\uFF09\uFF0C\u8BF7\u68C0\u67E5\u662F\u5426\u5B8C\u6574\u590D\u5236\uFF01");
   }
-  throw new Error("No Base64 decoder available in current runtime.");
 }
 async function exportEncryptedConfig(settings, pin) {
   if (!pin || pin.trim().length === 0) {

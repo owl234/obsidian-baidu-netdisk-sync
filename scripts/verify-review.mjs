@@ -109,35 +109,64 @@ async function main() {
     fullPayload = html;
   }
 
-  // Parse Version, Commit, and Status
-  // Pattern example: ["Version",":"," ",[...,"1.0.7"]],["Commit",":"," ",[...,"96b0e16"]],[...,"Failed"]
-  const versionMatches = [...fullPayload.matchAll(/Version.*?"children":"([^"]+)".*?Commit.*?"children":"([^"]+)".*?"children":"(Failed|Passed|Pending|Approved)"/gs)];
+  // Parse latest audit run
+  const runMatches = [...fullPayload.matchAll(/Commit.*?"children":"([a-f0-9]{7,})".*?"children":"(Completed|Failed|Passed|Pending|Approved)"/gs)];
   
   let latestVersion = 'Unknown';
   let latestCommit = 'Unknown';
   let overallStatus = 'Unknown';
+  let latestSlice = fullPayload;
 
-  if (versionMatches.length > 0) {
-    latestVersion = versionMatches[0][1];
-    latestCommit = versionMatches[0][2];
-    overallStatus = versionMatches[0][3];
+  if (runMatches.length > 0) {
+    const firstRun = runMatches[0];
+    latestCommit = firstRun[1];
+    overallStatus = firstRun[2];
+
+    const startPos = firstRun.index;
+    const endPos = runMatches.length > 1 ? runMatches[1].index : fullPayload.length;
+    latestSlice = fullPayload.slice(startPos, endPos);
+
+    const sliceBefore = fullPayload.slice(Math.max(0, startPos - 400), startPos);
+    const verMatch = sliceBefore.match(/Version.*?"children":"([^"]+)"/);
+    const refMatch = sliceBefore.match(/Ref.*?"children":"([^"]+)"/);
+    if (verMatch) {
+      latestVersion = verMatch[1];
+    } else if (refMatch) {
+      latestVersion = refMatch[1];
+    }
   } else {
-    // Fallback search
     const verMatch = fullPayload.match(/Version.*?(\d+\.\d+\.\d+)/);
     if (verMatch) latestVersion = verMatch[1];
-    const statusMatch = fullPayload.match(/(Failed|Passed|Approved|Pending)/);
+    const statusMatch = fullPayload.match(/(Completed|Failed|Passed|Approved|Pending)/);
     if (statusMatch) overallStatus = statusMatch[1];
   }
 
-  // Extract markdown issue blocks
+  // Extract markdown issue blocks for the latest run
   const mdRegex = /"markdown":"(.*?)"/g;
   const rawBlocks = [];
-  while ((match = mdRegex.exec(fullPayload)) !== null) {
+  while ((match = mdRegex.exec(latestSlice)) !== null) {
     try {
       const decoded = JSON.parse(`"${match[1]}"`);
       rawBlocks.push(decoded);
     } catch {
       rawBlocks.push(match[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'));
+    }
+  }
+
+  // Extract referenced RSC template strings (e.g. $47 -> 47:T...,)
+  const referencedIds = [...latestSlice.matchAll(/\$([a-f0-9]{1,4})\b/g)].map(m => m[1]);
+  for (const refId of referencedIds) {
+    const refPat = new RegExp(`${refId}:T[a-f0-9]+,(.*?)(?=\\n\\w+:|$)`, 's');
+    const refMatch = fullPayload.match(refPat);
+    if (refMatch) {
+      let text = refMatch[1];
+      // Truncate at next component payload boundary e.g. 3c:[ or \d+[a-z]?:
+      const jsonBoundary = text.search(/\d+[a-z0-9]?:\[/);
+      if (jsonBoundary !== -1) {
+        text = text.slice(0, jsonBoundary);
+      }
+      const decoded = text.replace(/\\n/g, '\n').replace(/\\"/g, '"');
+      rawBlocks.push(decoded);
     }
   }
 
@@ -172,7 +201,10 @@ async function main() {
         currentItem = { type: 'Pass', text: trimmed, details: [] };
         parsedItems.push(currentItem);
       } else if (currentItem && trimmed.startsWith('- ')) {
-        currentItem.details.push(trimmed);
+        const cleanDetail = trimmed.replace(/\d+[a-f0-9]?:\[.*$/, '').trim();
+        if (cleanDetail) {
+          currentItem.details.push(cleanDetail);
+        }
       }
     }
   }
@@ -203,7 +235,7 @@ async function main() {
   console.log(`${colors.bold}🔖 Latest Audited Version:${colors.reset} ${latestVersion} (${latestCommit})`);
   
   let statusBadge = overallStatus;
-  if (overallStatus === 'Passed' || overallStatus === 'Approved') {
+  if (overallStatus === 'Passed' || overallStatus === 'Approved' || overallStatus === 'Completed') {
     statusBadge = `${colors.bgGreen}${colors.bold} ${overallStatus.toUpperCase()} ${colors.reset}`;
   } else if (overallStatus === 'Failed') {
     statusBadge = `${colors.bgRed}${colors.bold} ${overallStatus.toUpperCase()} ${colors.reset}`;

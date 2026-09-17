@@ -27,32 +27,22 @@ export function uint8ArrayToBase64(bytes: Uint8Array): string {
     const chunk = Array.from(bytes.subarray(i, Math.min(i + chunkSize, len)));
     binary += String.fromCharCode.apply(null, chunk);
   }
-  if (typeof btoa !== "undefined") {
-    return btoa(binary);
-  } else if (typeof Buffer !== "undefined") {
-    return Buffer.from(bytes).toString("base64");
-  }
-  throw new Error("No Base64 encoder available in current runtime.");
+  return btoa(binary);
 }
 
 export function base64ToUint8Array(base64: string): Uint8Array {
   const clean = base64.trim();
   try {
-    if (typeof atob !== "undefined") {
-      const binary = atob(clean);
-      const len = binary.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      return bytes;
-    } else if (typeof Buffer !== "undefined") {
-      return new Uint8Array(Buffer.from(clean, "base64"));
+    const binary = atob(clean);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
     }
+    return bytes;
   } catch {
     throw new Error("配对码格式无效（Base64解析失败），请检查是否完整复制！");
   }
-  throw new Error("No Base64 decoder available in current runtime.");
 }
 
 /**

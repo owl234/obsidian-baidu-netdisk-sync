@@ -21,17 +21,13 @@ export function isEncrypted(buffer: ArrayBuffer): boolean {
 }
 
 function getCrypto(): Crypto {
+  if (typeof activeWindow !== "undefined" && activeWindow.crypto) {
+    return activeWindow.crypto;
+  }
   if (typeof window !== "undefined" && window.crypto) {
     return window.crypto;
   }
-  if (typeof activeWindow !== "undefined" && (activeWindow as Window)?.crypto) {
-    return (activeWindow as Window).crypto;
-  }
-  const fallbackCrypto = typeof global !== "undefined" ? (global as unknown as { crypto?: Crypto }).crypto : undefined;
-  if (fallbackCrypto) {
-    return fallbackCrypto;
-  }
-  throw new Error("Web Crypto API is not available.");
+  return crypto;
 }
 
 async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
