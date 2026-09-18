@@ -291,6 +291,93 @@ export class SyncEngine {
     }
   }
 
+  async convertVaultToPlaintext(
+    onProgress?: (processed: number, total: number, currentPath: string) => void
+  ): Promise<{ success: boolean; total: number; errors: number }> {
+    if (this.state !== "idle" && this.state !== "error") {
+      throw new Error("已有同步任务正在运行，请等待当前任务完成。");
+    }
+
+    const settings = this.getSettings();
+    if (!settings.accessToken) {
+      throw new Error("未配置百度网盘授权，请先前往设置授权账号。");
+    }
+
+    this.addLog("info", "启动全量解密迁移流程：开始拉取并解密云端全部最新文件确保本地完整...");
+    const pullResult = await this.startSync(false);
+    if (!pullResult.success && pullResult.stats.errors > 0) {
+      throw new Error(`云端预拉取未完全成功（存在 ${pullResult.stats.errors} 个错误），请在同步日志中检查并排除后再试，以防数据丢失。`);
+    }
+
+    this.setState("diffing", "正在扫描本地待迁移文件...");
+    const localFiles = await this.scanLocalFiles();
+    const total = localFiles.size;
+    let processed = 0;
+    let errors = 0;
+
+    this.addLog("info", `开始以明文全量重新上传 ${total} 个文件覆盖网盘历史密文...`);
+
+    const adapter = this.app.vault.adapter;
+    const cleanBase = settings.remoteBasePath.endsWith("/")
+      ? settings.remoteBasePath.slice(0, -1)
+      : settings.remoteBasePath;
+
+    this.setState("syncing", `正在以明文重新上传 (0/${total})...`);
+
+    for (const [path] of localFiles) {
+      await this.queue.add(async () => {
+        try {
+          if (!(await adapter.exists(path))) {
+            return;
+          }
+          const buffer = await adapter.readBinary(path);
+          const stat = await adapter.stat(path);
+          const localMtime = stat?.mtime || Date.now();
+          const remotePath = `${cleanBase}/${path}`;
+
+          // Explicitly upload with enableE2EE: false -> Pure Plaintext!
+          const res = await this.uploader.uploadFile(remotePath, buffer, {
+            enableE2EE: false
+          });
+
+          this.manifest.set({
+            path: path,
+            remotePath: remotePath,
+            mtime: localMtime,
+            remoteMtime: (res.mtime || Math.floor(Date.now() / 1000)) * 1000,
+            md5: res.md5 || "",
+            size: stat?.size || buffer.byteLength,
+            remoteSize: res.size,
+            fsId: res.fs_id
+          });
+          this.addLog("success", `明文重传成功: ${path}`);
+        } catch (err: unknown) {
+          errors++;
+          const msg = err instanceof Error ? err.message : String(err);
+          this.addLog("error", `明文重传失败: ${path}`, msg);
+        } finally {
+          processed++;
+          onProgress?.(processed, total, path);
+          this.setState("syncing", `正在以明文重新上传 (${processed}/${total})...`);
+        }
+      });
+    }
+
+    await this.queue.waitAll();
+
+    this.manifest.updateLastSyncTime();
+    await this.manifest.save();
+
+    settings.lastSyncTime = Date.now();
+    await this.saveSettings(settings);
+
+    this.setState("idle", "明文迁移重传完成");
+    const summary = `明文迁移完成！共处理 ${processed}/${total} 个文件，失败: ${errors}`;
+    this.addLog(errors > 0 ? "warn" : "success", summary);
+
+    return { success: errors === 0, total, errors };
+  }
+
   private async scanLocalFiles(): Promise<Map<string, LocalFileInfo>> {
     const adapter = this.app.vault.adapter;
     const result = new Map<string, LocalFileInfo>();

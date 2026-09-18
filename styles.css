@@ -82,3 +82,20 @@
     word-break: break-all;
     white-space: pre-wrap;
 }
+
+.baidu-sync-warning-box {
+    color: var(--text-warning);
+    background-color: var(--background-secondary);
+    border-left: 3px solid var(--text-warning);
+    padding: 8px 12px;
+    border-radius: 4px;
+}
+
+.baidu-sync-migration-status {
+    margin: 16px 0;
+    padding: 12px;
+    background-color: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+}
+

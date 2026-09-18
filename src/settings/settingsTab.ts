@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Setting, Notice, SettingDefinitionItem } from "obsidian";
 import type BaiduSyncPlugin from "../main";
 import { ExportConfigModal, ImportConfigModal } from "../ui/configShareModal";
+import { DecryptMigrationModal } from "../ui/decryptMigrationModal";
 
 export class BaiduSyncSettingTab extends PluginSettingTab {
   plugin: BaiduSyncPlugin;
@@ -316,6 +317,19 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           .onChange(async (val) => {
             this.plugin.settings.e2eePassword = val;
             await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("全量解密迁移 (转为明文同步)")
+      .setDesc("若准备停用 E2EE 加密，可一键先行拉取解密云端全部文件至本地，再将本地全部笔记以明文重新覆盖网盘。")
+      .addButton((btn) => {
+        btn
+          .setButtonText("🔓 全量解密并重传至网盘")
+          .onClick(() => {
+            new DecryptMigrationModal(this.app, this.plugin, () => {
+              this.renderSettings();
+            }).open();
           });
       });
   }
