@@ -67,6 +67,7 @@ var import_obsidian = require("obsidian");
 // src/crypto/e2ee.ts
 var MAGIC_HEADER = new Uint8Array([66, 68, 83, 89, 78, 67, 95, 69, 50, 69, 69, 1]);
 var PBKDF2_ITERATIONS = 6e5;
+var LEGACY_PBKDF2_ITERATIONS = 1e5;
 function isEncrypted(buffer) {
   if (buffer.byteLength < MAGIC_HEADER.length + 16 + 12 + 16) {
     return false;
@@ -88,7 +89,7 @@ function getCrypto() {
   }
   return crypto;
 }
-async function deriveKey(password, salt) {
+async function deriveKey(password, salt, iterations = PBKDF2_ITERATIONS) {
   const enc = new TextEncoder();
   const crypto2 = getCrypto();
   const keyMaterial = await crypto2.subtle.importKey(
@@ -102,7 +103,7 @@ async function deriveKey(password, salt) {
     {
       name: "PBKDF2",
       salt,
-      iterations: PBKDF2_ITERATIONS,
+      iterations,
       hash: "SHA-256"
     },
     keyMaterial,
@@ -146,9 +147,9 @@ async function decryptData(encryptedBuffer, password) {
   const iv = new Uint8Array(encryptedBuffer, offset, 12);
   offset += 12;
   const ciphertext = encryptedBuffer.slice(offset);
-  const key = await deriveKey(password, salt);
+  const crypto2 = getCrypto();
   try {
-    const crypto2 = getCrypto();
+    const key = await deriveKey(password, salt, PBKDF2_ITERATIONS);
     return await crypto2.subtle.decrypt(
       {
         name: "AES-GCM",
@@ -158,7 +159,19 @@ async function decryptData(encryptedBuffer, password) {
       ciphertext
     );
   } catch {
-    throw new Error("E2EE \u89E3\u5BC6\u5931\u8D25\uFF1A\u5BC6\u7801\u9519\u8BEF\u6216\u6587\u4EF6\u635F\u574F");
+    try {
+      const legacyKey = await deriveKey(password, salt, LEGACY_PBKDF2_ITERATIONS);
+      return await crypto2.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv
+        },
+        legacyKey,
+        ciphertext
+      );
+    } catch {
+      throw new Error("E2EE \u89E3\u5BC6\u5931\u8D25\uFF1A\u5BC6\u7801\u9519\u8BEF\u6216\u6587\u4EF6\u635F\u574F");
+    }
   }
 }
 

@@ -4,6 +4,7 @@ import { SyncPlanner, LocalFileInfo, RemoteFileInfo } from "../src/sync/planner"
 import { SyncFilter } from "../src/sync/filter";
 import { DEFAULT_SETTINGS } from "../src/settings/settings";
 import { exportEncryptedConfig, importEncryptedConfig } from "../src/crypto/configShare";
+import { encryptData, decryptData, deriveKey, LEGACY_PBKDF2_ITERATIONS, isEncrypted } from "../src/crypto/e2ee";
 
 function testMD5() {
   console.log("-> Testing MD5...");
@@ -275,11 +276,59 @@ async function testConfigShare() {
   console.log("   ConfigShare tests passed!");
 }
 
+async function testE2EEFallback() {
+  console.log("-> Testing E2EE & Backward-Compatible Iteration Fallback...");
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const testPassword = "VaultSecretPassword!@#";
+  const rawData = enc.encode(JSON.stringify({ plugin: "terminal", enabled: true, data: "some-json-content" })).buffer;
+
+  // 1. Standard encryption with 600,000 iterations
+  const encryptedStandard = await encryptData(rawData, testPassword);
+  assert.ok(isEncrypted(encryptedStandard), "Must be recognized as encrypted");
+  const decryptedStandard = await decryptData(encryptedStandard, testPassword);
+  assert.strictEqual(dec.decode(decryptedStandard), dec.decode(rawData), "Standard 600k decrypt mismatch");
+
+  // 2. Simulate legacy file encrypted with 100,000 iterations (pre-v1.0.7)
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const legacyKey = await deriveKey(testPassword, salt, LEGACY_PBKDF2_ITERATIONS);
+  const legacyCipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, legacyKey, rawData);
+  const MAGIC_HEADER = new Uint8Array([0x42, 0x44, 0x53, 0x59, 0x4e, 0x43, 0x5f, 0x45, 0x32, 0x45, 0x45, 0x01]);
+  const legacyBuffer = new Uint8Array(MAGIC_HEADER.length + salt.length + iv.length + legacyCipher.byteLength);
+  let offset = 0;
+  legacyBuffer.set(MAGIC_HEADER, offset);
+  offset += MAGIC_HEADER.length;
+  legacyBuffer.set(salt, offset);
+  offset += salt.length;
+  legacyBuffer.set(iv, offset);
+  offset += iv.length;
+  legacyBuffer.set(new Uint8Array(legacyCipher), offset);
+
+  // Decrypt legacy file using decryptData -> should automatically fall back to 100k and succeed!
+  const decryptedLegacy = await decryptData(legacyBuffer.buffer, testPassword);
+  assert.strictEqual(dec.decode(decryptedLegacy), dec.decode(rawData), "Legacy 100k decrypt mismatch");
+
+  // 3. Decrypt with wrong password -> must throw error
+  let wrongPasswordThrown = false;
+  try {
+    await decryptData(legacyBuffer.buffer, "WrongPassword");
+  } catch (err: unknown) {
+    wrongPasswordThrown = true;
+    const msg = err instanceof Error ? err.message : String(err);
+    assert.ok(msg.includes("密码错误或文件损坏"), "Should throw password or corruption error");
+  }
+  assert.ok(wrongPasswordThrown, "Must throw on wrong password");
+
+  console.log("   E2EE backward compatibility tests passed!");
+}
+
 async function runAll() {
   testMD5();
   testFilter();
   testPlannerLWW();
   await testConfigShare();
+  await testE2EEFallback();
   console.log("🎉 All unit tests passed successfully!");
 }
 
