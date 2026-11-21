@@ -1,11 +1,15 @@
 export class AsyncQueue {
   private activeCount = 0;
   private queue: Array<() => Promise<void>> = [];
+  private idleResolvers: Array<() => void> = [];
 
-  constructor(private concurrency: number = 3) {}
+  constructor(private concurrency: number = 3) {
+    this.concurrency = Math.max(1, concurrency);
+  }
 
   setConcurrency(concurrency: number): void {
     this.concurrency = Math.max(1, concurrency);
+    this.next();
   }
 
   add<T>(task: () => Promise<T>): Promise<T> {
@@ -19,6 +23,7 @@ export class AsyncQueue {
         } finally {
           this.activeCount--;
           this.next();
+          this.checkIdle();
         }
       };
 
@@ -37,9 +42,22 @@ export class AsyncQueue {
     }
   }
 
-  async waitAll(): Promise<void> {
-    while (this.activeCount > 0 || this.queue.length > 0) {
-      await new Promise((r) => window.setTimeout(r, 50));
+  private checkIdle(): void {
+    if (this.activeCount === 0 && this.queue.length === 0 && this.idleResolvers.length > 0) {
+      const resolvers = this.idleResolvers;
+      this.idleResolvers = [];
+      for (const resolve of resolvers) {
+        resolve();
+      }
     }
+  }
+
+  waitAll(): Promise<void> {
+    if (this.activeCount === 0 && this.queue.length === 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.idleResolvers.push(resolve);
+    });
   }
 }

@@ -2,6 +2,8 @@ import { App, PluginSettingTab, Setting, Notice, SettingDefinitionItem } from "o
 import type BaiduSyncPlugin from "../main";
 import { ExportConfigModal, ImportConfigModal } from "../ui/configShareModal";
 import { DecryptMigrationModal } from "../ui/decryptMigrationModal";
+import { clearKeyCache } from "../crypto/e2ee";
+import { t } from "../i18n";
 
 export class BaiduSyncSettingTab extends PluginSettingTab {
   plugin: BaiduSyncPlugin;
@@ -27,34 +29,27 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl).setName("百度网盘同步设置").setHeading();
-
     // Section 1: Authentication
-    new Setting(containerEl).setName("1. 百度网盘账号授权 (OAuth 2.0)").setHeading();
+    new Setting(containerEl).setName(t("settings.sec1.heading")).setHeading();
 
-    const authDesc = containerEl.createDiv({ cls: "setting-item-description" });
+    const authDesc = containerEl.createDiv({ cls: "setting-item-description baidu-sync-setting-desc" });
     const p1 = authDesc.createDiv();
-    p1.appendText("1. 访问 ");
-    const link = p1.createEl("a", { text: "百度网盘开放平台", href: "https://pan.baidu.com/union" });
+    p1.appendText(`${t("settings.sec1.step1")} `);
+    const link = p1.createEl("a", {
+      text: t("settings.sec1.platformLink"),
+      href: "https://pan.baidu.com/union"
+    });
     link.setAttr("target", "_blank");
-    p1.appendText(" 登录并创建个人开发者应用。");
 
-    const p2 = authDesc.createDiv();
-    p2.appendText("2. 获取应用的 ");
-    p2.createEl("b", { text: "AppKey" });
-    p2.appendText(" 与 ");
-    p2.createEl("b", { text: "AppSecret" });
-    p2.appendText(" 并填入下方。");
-
-    const p3 = authDesc.createDiv();
-    p3.appendText("3. 点击“获取网页授权码”，在弹出的页面登录并授权，将网页返回的授权码粘贴至下方换取 Token。");
+    authDesc.createDiv({ text: t("settings.sec1.step2") });
+    authDesc.createDiv({ text: t("settings.sec1.step3") });
 
     new Setting(containerEl)
-      .setName("AppKey (Client ID)")
-      .setDesc("开放平台应用凭证 AppKey")
+      .setName(t("settings.appKey.name"))
+      .setDesc(t("settings.appKey.desc"))
       .addText((text) =>
         text
-          .setPlaceholder("请输入 AppKey")
+          .setPlaceholder(t("settings.appKey.placeholder"))
           .setValue(this.plugin.settings.appKey)
           .onChange(async (value) => {
             this.plugin.settings.appKey = value.trim();
@@ -63,12 +58,12 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("AppSecret (Client Secret)")
-      .setDesc("开放平台应用密钥 AppSecret")
+      .setName(t("settings.appSecret.name"))
+      .setDesc(t("settings.appSecret.desc"))
       .addText((text) => {
         text.inputEl.type = "password";
         text
-          .setPlaceholder("请输入 AppSecret")
+          .setPlaceholder(t("settings.appSecret.placeholder"))
           .setValue(this.plugin.settings.appSecret)
           .onChange(async (value) => {
             this.plugin.settings.appSecret = value.trim();
@@ -78,97 +73,93 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
 
     let authCodeInput = "";
     new Setting(containerEl)
-      .setName("获取授权并换取 Token")
+      .setName(t("settings.authStatus.name"))
       .setDesc(
         this.plugin.settings.accessToken
-          ? "✅ 已授权网盘账号"
-          : "⚠️ 尚未绑定百度网盘"
+          ? t("settings.authStatus.connected")
+          : t("settings.authStatus.disconnected")
       )
       .addButton((btn) =>
-        btn.setButtonText("第一步：打开授权网页").onClick(() => {
+        btn.setButtonText(t("settings.authStatus.openBtn")).onClick(() => {
           try {
             const url = this.plugin.oauth.getOAuthUrl();
             window.open(url);
-            new Notice("请在浏览器完成授权，并复制网页中的授权码！");
+            new Notice(t("settings.authStatus.openNotice"));
           } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : "请先填写 AppKey";
+            const msg = err instanceof Error ? err.message : t("oauth.missingAppKey");
             new Notice(msg);
           }
         })
       );
 
     new Setting(containerEl)
-      .setName("填入授权码 (Authorization Code)")
-      .setDesc("将网页中获取的 Code 粘贴在此处换取持久凭据")
+      .setName(t("settings.authCode.name"))
+      .setDesc(t("settings.authCode.desc"))
       .addText((text) =>
         text
-          .setPlaceholder("粘贴授权码...")
+          .setPlaceholder(t("settings.authCode.placeholder"))
           .onChange((value) => {
             authCodeInput = value.trim();
           })
       )
       .addButton((btn) =>
         btn
-          .setButtonText("第二步：确认换取 Token")
+          .setButtonText(t("settings.authCode.exchangeBtn"))
           .setCta()
           .onClick(async () => {
             if (!authCodeInput) {
-              new Notice("请先输入网页返回的授权码");
+              new Notice(t("settings.authCode.missingNotice"));
               return;
             }
             try {
               btn.setDisabled(true);
-              btn.setButtonText("正在换取...");
+              btn.setButtonText(t("settings.authCode.exchangingBtn"));
               await this.plugin.oauth.exchangeCodeForToken(authCodeInput);
-              new Notice("🎉 百度网盘账号绑定成功！");
-              this.renderSettings(); // Refresh tab view
+              new Notice(t("settings.authCode.successNotice"));
+              this.renderSettings();
             } catch (err: unknown) {
               const msg = err instanceof Error ? err.message : String(err);
-              new Notice(`绑定失败: ${msg}`);
+              new Notice(t("settings.authCode.failNotice", { msg }));
             } finally {
               btn.setDisabled(false);
-              btn.setButtonText("第二步：确认换取 Token");
+              btn.setButtonText(t("settings.authCode.exchangeBtn"));
             }
           })
       );
 
     // Section 2: Multi-Device Quick Pairing & Config Migration
-    new Setting(containerEl).setName("2. 📱 多设备快速配对与配置迁移").setHeading();
+    new Setting(containerEl).setName(t("settings.sec2.heading")).setHeading();
 
     const pairDesc = containerEl.createDiv({
-      cls: "setting-item-description baidu-sync-setting-desc",
+      cls: "setting-item-description baidu-sync-setting-desc"
     });
-    pairDesc.setText(
-      "免去手机/平板端重复申请开放平台应用与繁琐授权流程。在已配置的主设备上一键导出加密配对码，在第二台设备直接导入即可秒级完成全端同步连接。"
-    );
+    pairDesc.setText(t("settings.sec2.desc"));
 
     new Setting(containerEl)
-      .setName("多设备配对管理")
-      .setDesc("通过 AES-256-GCM 密码保护的配对码在手机、平板与电脑间安全迁移授权与设置")
+      .setName(t("settings.pairing.name"))
+      .setDesc(t("settings.pairing.desc"))
       .addButton((btn) =>
         btn
-          .setButtonText("📤 导出配置至其他设备")
+          .setButtonText(t("settings.pairing.exportBtn"))
           .setCta()
           .onClick(() => {
             new ExportConfigModal(this.app, this.plugin).open();
           })
       )
       .addButton((btn) =>
-        btn
-          .setButtonText("📥 导入外部设备配置")
-          .onClick(() => {
-            new ImportConfigModal(this.app, this.plugin, () => {
-              this.renderSettings();
-            }).open();
-          })
+        btn.setButtonText(t("settings.pairing.importBtn")).onClick(() => {
+          new ImportConfigModal(this.app, this.plugin, () => {
+            this.renderSettings();
+          }).open();
+        })
       );
 
-    // Section 3: Storage Path
-    new Setting(containerEl).setName("3. 存储与目录规划").setHeading();
+    // Section 3: Storage Path & Conflict Policy
+    new Setting(containerEl).setName(t("settings.sec3.heading")).setHeading();
 
     new Setting(containerEl)
-      .setName("网盘端根目录")
-      .setDesc("网盘中存放此知识库的绝对路径 (默认: /apps/obsidian_vault)")
+      .setName(t("settings.remotePath.name"))
+      .setDesc(t("settings.remotePath.desc"))
       .addText((text) =>
         text
           .setPlaceholder("/apps/obsidian_vault")
@@ -179,13 +170,27 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName(t("settings.conflict.name"))
+      .setDesc(t("settings.conflict.desc"))
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("copy", t("settings.conflict.optCopy"))
+          .addOption("lww", t("settings.conflict.optLww"))
+          .setValue(this.plugin.settings.conflictStrategy || "copy")
+          .onChange(async (val) => {
+            this.plugin.settings.conflictStrategy = val === "lww" ? "lww" : "copy";
+            await this.plugin.saveSettings();
+          })
+      );
+
     // Section 4: Scope and Filtering
-    new Setting(containerEl).setName("4. 配置同步与文件过滤").setHeading();
+    new Setting(containerEl).setName(t("settings.sec4.heading")).setHeading();
 
     const configDirName = this.app.vault.configDir;
     new Setting(containerEl)
-      .setName(`同步 ${configDirName} 配置目录`)
-      .setDesc(`开启后将同步 ${configDirName} 中的插件、外观与全局配置（自动排除 workspace.json 布局缓存）`)
+      .setName(t("settings.syncConfig.name", { configDir: configDirName }))
+      .setDesc(t("settings.syncConfig.desc", { configDir: configDirName }))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.syncObsidianConfig)
@@ -196,8 +201,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(`同步第三方插件 (${configDirName}/plugins)`)
-      .setDesc("开启后将在多端同步已安装的社区插件")
+      .setName(t("settings.syncPlugins.name", { configDir: configDirName }))
+      .setDesc(t("settings.syncPlugins.desc"))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.syncPlugins)
@@ -208,8 +213,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(`同步外观与主题 (${configDirName}/themes)`)
-      .setDesc("开启后同步已下载的主题与 CSS 片段")
+      .setName(t("settings.syncThemes.name", { configDir: configDirName }))
+      .setDesc(t("settings.syncThemes.desc"))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.syncThemes)
@@ -220,8 +225,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("排除规则 (Ignored Patterns)")
-      .setDesc("每行一条 Glob 匹配规则，匹配的文件将完全不参与同步")
+      .setName(t("settings.ignoredPatterns.name"))
+      .setDesc(t("settings.ignoredPatterns.desc"))
       .addTextArea((area) => {
         area.inputEl.rows = 6;
         area.inputEl.addClass("baidu-sync-textarea");
@@ -234,11 +239,11 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       });
 
     // Section 5: Trigger Settings
-    new Setting(containerEl).setName("5. 同步触发机制").setHeading();
+    new Setting(containerEl).setName(t("settings.sec5.heading")).setHeading();
 
     new Setting(containerEl)
-      .setName("启动时自动同步")
-      .setDesc("打开 Obsidian 时自动在后台执行一次静默同步")
+      .setName(t("settings.syncOnStartup.name"))
+      .setDesc(t("settings.syncOnStartup.desc"))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.syncOnStartup)
@@ -249,8 +254,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("定时自动同步周期 (分钟)")
-      .setDesc("设定后台定时静默同步的时间间隔，设为 0 则禁用定时同步")
+      .setName(t("settings.syncInterval.name"))
+      .setDesc(t("settings.syncInterval.desc"))
       .addText((text) =>
         text
           .setPlaceholder("10")
@@ -264,8 +269,8 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("保存/修改后防抖自动同步")
-      .setDesc("文件保存或编辑停止一段时间后自动触发同步")
+      .setName(t("settings.syncOnSave.name"))
+      .setDesc(t("settings.syncOnSave.desc"))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.syncOnSave)
@@ -275,12 +280,26 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           })
       );
 
-    // Section 6: Concurrency & Performance
-    new Setting(containerEl).setName("6. 传输调度与网络并发").setHeading();
+    new Setting(containerEl)
+      .setName(t("settings.syncDebounce.name"))
+      .setDesc(t("settings.syncDebounce.desc"))
+      .addText((text) =>
+        text
+          .setPlaceholder("5")
+          .setValue(String(this.plugin.settings.syncDebounceSeconds || 5))
+          .onChange(async (val) => {
+            const num = parseInt(val, 10);
+            this.plugin.settings.syncDebounceSeconds = isNaN(num) ? 5 : Math.max(1, num);
+            await this.plugin.saveSettings();
+          })
+      );
+
+    // Section 6: Concurrency & Safety Limits
+    new Setting(containerEl).setName(t("settings.sec6.heading")).setHeading();
 
     new Setting(containerEl)
-      .setName("并发传输请求数 (1~5)")
-      .setDesc("同时上传/下载的任务数，推荐设为 2~3 避免触发百度网盘 QPS 频率限制")
+      .setName(t("settings.concurrency.name"))
+      .setDesc(t("settings.concurrency.desc"))
       .addSlider((slider) =>
         slider
           .setLimits(1, 5, 1)
@@ -291,12 +310,26 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName(t("settings.maxFileSize.name"))
+      .setDesc(t("settings.maxFileSize.desc"))
+      .addText((text) =>
+        text
+          .setPlaceholder("100")
+          .setValue(String(this.plugin.settings.maxFileSizeMB))
+          .onChange(async (val) => {
+            const num = parseInt(val, 10);
+            this.plugin.settings.maxFileSizeMB = isNaN(num) ? 100 : Math.max(0, num);
+            await this.plugin.saveSettings();
+          })
+      );
+
     // Section 7: End-to-End Encryption
-    new Setting(containerEl).setName("7. 端到端隐私加密 (E2EE)").setHeading();
+    new Setting(containerEl).setName(t("settings.sec7.heading")).setHeading();
 
     new Setting(containerEl)
-      .setName("开启 AES-256-GCM 端到端加密")
-      .setDesc("开启后所有文件在上传到百度网盘前均会进行高强度加密，网盘端无法查看明文。注意：多端同步必须配置完全相同的密码！")
+      .setName(t("settings.enableE2EE.name"))
+      .setDesc(t("settings.enableE2EE.desc"))
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.enableE2EE)
@@ -307,30 +340,29 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("E2EE 解密与加密密码")
-      .setDesc("用于生成派生秘钥的主密码")
+      .setName(t("settings.e2eePassword.name"))
+      .setDesc(t("settings.e2eePassword.desc"))
       .addText((text) => {
         text.inputEl.type = "password";
         text
-          .setPlaceholder("请输入加密密码")
+          .setPlaceholder(t("settings.e2eePassword.placeholder"))
           .setValue(this.plugin.settings.e2eePassword)
           .onChange(async (val) => {
             this.plugin.settings.e2eePassword = val;
+            clearKeyCache();
             await this.plugin.saveSettings();
           });
       });
 
     new Setting(containerEl)
-      .setName("全量解密迁移 (转为明文同步)")
-      .setDesc("若准备停用 E2EE 加密，可一键先行拉取解密云端全部文件至本地，再将本地全部笔记以明文重新覆盖网盘。")
+      .setName(t("settings.migration.name"))
+      .setDesc(t("settings.migration.desc"))
       .addButton((btn) => {
-        btn
-          .setButtonText("🔓 全量解密并重传至网盘")
-          .onClick(() => {
-            new DecryptMigrationModal(this.app, this.plugin, () => {
-              this.renderSettings();
-            }).open();
-          });
+        btn.setButtonText(t("settings.migration.btn")).onClick(() => {
+          new DecryptMigrationModal(this.app, this.plugin, () => {
+            this.renderSettings();
+          }).open();
+        });
       });
   }
 }

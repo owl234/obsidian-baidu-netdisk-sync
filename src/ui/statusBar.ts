@@ -1,7 +1,10 @@
 import { SyncEngine, SyncState } from "../sync/engine";
+import { t } from "../i18n";
 
 export class StatusBarManager {
   private statusBarEl: HTMLElement;
+  private unsubscribeState?: () => void;
+  private clickHandler: () => void;
 
   constructor(
     statusBarItem: HTMLElement,
@@ -10,18 +13,19 @@ export class StatusBarManager {
   ) {
     this.statusBarEl = statusBarItem;
     this.statusBarEl.addClass("baidu-sync-status-bar");
-    this.statusBarEl.addEventListener("click", () => this.onClick());
+    this.clickHandler = () => this.onClick();
+    this.statusBarEl.addEventListener("click", this.clickHandler);
 
-    this.engine.onStateChange((state, msg) => {
+    this.unsubscribeState = this.engine.onStateChange((state, msg) => {
       this.updateState(state, msg);
     });
 
-    this.updateState("idle", "空闲");
+    this.updateState("idle", t("statusBar.idle"));
   }
 
   updateState(state: SyncState, message?: string): void {
     let icon = "☁️";
-    let text = message || "就绪";
+    const text = message || t("statusBar.ready");
 
     switch (state) {
       case "idle":
@@ -37,6 +41,12 @@ export class StatusBarManager {
         break;
     }
 
-    this.statusBarEl.setText(`${icon} 网盘: ${text}`);
+    this.statusBarEl.setText(`${icon} ${t("statusBar.prefix")}: ${text}`);
+  }
+
+  destroy(): void {
+    this.unsubscribeState?.();
+    this.unsubscribeState = undefined;
+    this.statusBarEl.removeEventListener("click", this.clickHandler);
   }
 }

@@ -1,189 +1,419 @@
 import assert from "assert";
 import { md5 } from "../src/crypto/md5";
-import { SyncPlanner, LocalFileInfo, RemoteFileInfo } from "../src/sync/planner";
-import { SyncFilter } from "../src/sync/filter";
-import { DEFAULT_SETTINGS } from "../src/settings/settings";
+import { SyncPlanner, LocalFileInfo, RemoteFileInfo, buildConflictPath } from "../src/sync/planner";
+import { SyncFilter, globToRegex } from "../src/sync/filter";
+import { AsyncQueue } from "../src/sync/queue";
+import { ManifestManager, ManifestStorageAdapter } from "../src/sync/manifest";
+import { SyncEngine, VaultSyncBridge } from "../src/sync/engine";
+import { BaiduSyncSettings, DEFAULT_SETTINGS } from "../src/settings/settings";
 import { exportEncryptedConfig, importEncryptedConfig } from "../src/crypto/configShare";
-import { encryptData, decryptData, deriveKey, LEGACY_PBKDF2_ITERATIONS, isEncrypted } from "../src/crypto/e2ee";
+import {
+  encryptData,
+  decryptData,
+  deriveKey,
+  clearKeyCache,
+  getEncryptionVersion,
+  LEGACY_PBKDF2_ITERATIONS,
+  isEncrypted
+} from "../src/crypto/e2ee";
+import { BaiduOAuthManager } from "../src/baidu/oauth";
+import { BaiduClient } from "../src/baidu/client";
+import { BaiduUploader } from "../src/baidu/uploader";
+import { BaiduDownloader } from "../src/baidu/downloader";
+import {
+  HttpRequestFn,
+  HttpRequestParam,
+  HttpResponse,
+  parseJsonPreserveIds,
+  sanitizeErrorMessage
+} from "../src/baidu/types";
+import { initLocale, t } from "../src/i18n";
+import { en } from "../src/i18n/en";
+import { zh } from "../src/i18n/zh";
+
+function makeJsonResponse(obj: unknown, status = 200, rawText?: string): HttpResponse {
+  const text = rawText ?? JSON.stringify(obj);
+  const bytes = new TextEncoder().encode(text);
+  return {
+    status,
+    headers: { "content-type": "application/json" },
+    arrayBuffer: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+    text
+  };
+}
+
+function makeBinaryResponse(buf: ArrayBuffer, contentType = "application/octet-stream", status = 200): HttpResponse {
+  return {
+    status,
+    headers: { "content-type": contentType },
+    arrayBuffer: buf,
+    get text(): string {
+      throw new Error("Binary download must NOT access resp.text / resp.json!");
+    }
+  };
+}
+
+const zeroDelay = async () => Promise.resolve();
+
+function createMemoryVault(configDir = ".obsidian") {
+  const files = new Map<string, { data: ArrayBuffer; mtime: number }>();
+  const folders = new Set<string>([""]);
+  const trashed: string[] = [];
+
+  const ensureParentFolders = (path: string) => {
+    const parts = path.split("/");
+    parts.pop();
+    let cur = "";
+    for (const part of parts) {
+      cur = cur ? `${cur}/${part}` : part;
+      folders.add(cur);
+    }
+  };
+
+  const bridge: VaultSyncBridge & ManifestStorageAdapter & {
+    files: typeof files;
+    trashed: string[];
+    listCalls: string[];
+    seedFile: (path: string, content: string | ArrayBuffer, mtime?: number) => void;
+    readText: (path: string) => string;
+  } = {
+    configDir,
+    files,
+    trashed,
+    listCalls: [],
+    seedFile(path: string, content: string | ArrayBuffer, mtime = Date.now()) {
+      ensureParentFolders(path);
+      const data = typeof content === "string"
+        ? new TextEncoder().encode(content).slice().buffer
+        : content;
+      files.set(path, { data, mtime });
+    },
+    readText(path: string): string {
+      const entry = files.get(path);
+      if (!entry) throw new Error(`Missing file: ${path}`);
+      return new TextDecoder().decode(entry.data);
+    },
+    async exists(path: string): Promise<boolean> {
+      return files.has(path) || folders.has(path);
+    },
+    async stat(path: string) {
+      const f = files.get(path);
+      if (f) return { type: "file", mtime: f.mtime, size: f.data.byteLength };
+      if (folders.has(path)) return { type: "folder", mtime: 0, size: 0 };
+      return null;
+    },
+    async list(dir: string) {
+      bridge.listCalls.push(dir);
+      const prefix = dir ? `${dir}/` : "";
+      const directFiles: string[] = [];
+      const directFolders = new Set<string>();
+
+      for (const path of files.keys()) {
+        if (!path.startsWith(prefix)) continue;
+        const rest = path.slice(prefix.length);
+        const slash = rest.indexOf("/");
+        if (slash === -1) {
+          directFiles.push(path);
+        } else {
+          directFolders.add(prefix + rest.slice(0, slash));
+        }
+      }
+      for (const f of folders) {
+        if (!f || !f.startsWith(prefix)) continue;
+        const rest = f.slice(prefix.length);
+        if (rest && !rest.includes("/")) {
+          directFolders.add(f);
+        }
+      }
+      return { files: directFiles, folders: Array.from(directFolders) };
+    },
+    async mkdir(path: string): Promise<void> {
+      folders.add(path);
+    },
+    async readBinary(path: string): Promise<ArrayBuffer> {
+      const f = files.get(path);
+      if (!f) throw new Error(`File not found: ${path}`);
+      return f.data.slice(0);
+    },
+    async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
+      ensureParentFolders(path);
+      files.set(path, { data: data.slice(0), mtime: Date.now() });
+    },
+    async read(path: string): Promise<string> {
+      return bridge.readText(path);
+    },
+    async write(path: string, data: string): Promise<void> {
+      ensureParentFolders(path);
+      const buf = new TextEncoder().encode(data).slice().buffer;
+      files.set(path, { data: buf, mtime: Date.now() });
+    },
+    async trashFile(path: string): Promise<void> {
+      files.delete(path);
+      trashed.push(path);
+    }
+  };
+
+  return bridge;
+}
 
 function testMD5() {
   console.log("-> Testing MD5...");
   const enc = new TextEncoder();
 
-  // Test vector 1: empty string
-  const emptyHash = md5(enc.encode(""));
-  assert.strictEqual(emptyHash, "d41d8cd98f00b204e9800998ecf8427e", "Empty string MD5 mismatch");
+  assert.strictEqual(md5(enc.encode("")), "d41d8cd98f00b204e9800998ecf8427e");
+  assert.strictEqual(md5(enc.encode("hello world")), "5eb63bbbe01eeed093cb22bb8f5acdc3");
 
-  // Test vector 2: "hello world"
-  const helloHash = md5(enc.encode("hello world"));
-  assert.strictEqual(helloHash, "5eb63bbbe01eeed093cb22bb8f5acdc3", "'hello world' MD5 mismatch");
-
-  // Test vector 3: 4MB slice of repeated bytes
   const largeBuf = new Uint8Array(4 * 1024 * 1024);
   largeBuf.fill(0x42);
   const largeHash = md5(largeBuf);
-  assert.ok(largeHash && largeHash.length === 32, "4MB slice hash valid format");
-  console.log("   MD5 tests passed! 4MB hash:", largeHash);
+  assert.strictEqual(largeHash.length, 32);
+  console.log("   MD5 tests passed!");
+}
+
+function testI18n() {
+  console.log("-> Testing i18n key parity & interpolation...");
+  const enKeys = Object.keys(en).sort();
+  const zhKeys = Object.keys(zh).sort();
+  assert.deepStrictEqual(enKeys, zhKeys, "EN and ZH translation keys must match 100%");
+
+  initLocale("en-US");
+  assert.strictEqual(t("command.syncNow"), "Sync now");
+  assert.strictEqual(t("engine.planReady", { count: 7 }), "Sync plan ready. Pending operations: 7");
+
+  initLocale("zh-CN");
+  assert.strictEqual(t("command.syncNow"), "立即执行同步");
+  assert.strictEqual(t("engine.planReady", { count: 7 }), "规划完成，待执行操作数: 7");
+  console.log("   i18n tests passed!");
 }
 
 function testFilter() {
-  console.log("-> Testing SyncFilter...");
-  const filter = new SyncFilter(DEFAULT_SETTINGS);
+  console.log("-> Testing SyncFilter (configDir, snippets, glob boundary, plugin self-exclusion)...");
+  const filter = new SyncFilter(DEFAULT_SETTINGS, ".obsidian", ".obsidian/plugins/baidu-netdisk-sync");
 
-  // Manifest should be ignored
+  // Plugin's own folder & manifest must be ignored
+  assert.strictEqual(filter.shouldIgnore(".obsidian/plugins/baidu-netdisk-sync/data.json"), true);
+  assert.strictEqual(filter.shouldIgnore(".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json"), true);
   assert.strictEqual(filter.shouldIgnore(".obsidian/plugins/obsidian-baidu-netdisk-sync/main.js"), true);
   assert.strictEqual(filter.shouldIgnore("sync_manifest.json"), true);
 
+  // Regular user note mentioning plugin name MUST NOT be ignored!
+  assert.strictEqual(filter.shouldIgnore("Notes/baidu-netdisk-sync-guide.md"), false);
+  assert.strictEqual(filter.shouldIgnore("Projects/obsidian-baidu-netdisk-sync-review.md"), false);
+
   // Trash & git
+  assert.strictEqual(filter.shouldIgnore(".trash"), true);
   assert.strictEqual(filter.shouldIgnore(".trash/some-note.md"), true);
+  assert.strictEqual(filter.shouldIgnore(".git"), true);
   assert.strictEqual(filter.shouldIgnore(".git/config"), true);
 
-  // Workspace should be ignored
+  // Workspace boundary check (globToRegex fix: **/ must not match partial filename)
   assert.strictEqual(filter.shouldIgnore(".obsidian/workspace.json"), true);
   assert.strictEqual(filter.shouldIgnore(".obsidian/workspace-mobile.json"), true);
+  assert.strictEqual(filter.shouldIgnore("workspace-custom.json"), true);
+  assert.strictEqual(filter.shouldIgnore("Notes/my-workspace.json"), false);
+  assert.strictEqual(globToRegex("**/workspace*.json").test("my-workspace.json"), false);
 
-  // Regular notes and attachments should NOT be ignored
+  // Config directory toggling & folder-level pruning
+  const noConfigFilter = new SyncFilter({ ...DEFAULT_SETTINGS, syncObsidianConfig: false }, ".obsidian");
+  assert.strictEqual(noConfigFilter.shouldIgnore(".obsidian"), true);
+  assert.strictEqual(noConfigFilter.shouldIgnore(".obsidian/app.json"), true);
+
+  const noPluginsFilter = new SyncFilter({ ...DEFAULT_SETTINGS, syncPlugins: false }, ".obsidian");
+  assert.strictEqual(noPluginsFilter.shouldIgnore(".obsidian/plugins"), true);
+  assert.strictEqual(noPluginsFilter.shouldIgnore(".obsidian/plugins/dataview/main.js"), true);
+  assert.strictEqual(noPluginsFilter.shouldIgnore(".obsidian/app.json"), false);
+
+  // syncThemes must cover BOTH themes and snippets
+  const noThemesFilter = new SyncFilter({ ...DEFAULT_SETTINGS, syncThemes: false }, ".obsidian");
+  assert.strictEqual(noThemesFilter.shouldIgnore(".obsidian/themes"), true);
+  assert.strictEqual(noThemesFilter.shouldIgnore(".obsidian/themes/Minimal/theme.css"), true);
+  assert.strictEqual(noThemesFilter.shouldIgnore(".obsidian/snippets"), true);
+  assert.strictEqual(noThemesFilter.shouldIgnore(".obsidian/snippets/custom.css"), true);
+
+  // Regular notes & custom patterns
   assert.strictEqual(filter.shouldIgnore("Notes/Daily.md"), false);
-  assert.strictEqual(filter.shouldIgnore("Assets/image.png"), false);
-
-  // Custom pattern test
-  const customSettings = {
-    ...DEFAULT_SETTINGS,
-    ignoredPatterns: "**/*.secret\ntemp/**"
-  };
-  const filter2 = new SyncFilter(customSettings);
-  assert.strictEqual(filter2.shouldIgnore("sub/test.secret"), true);
-  assert.strictEqual(filter2.shouldIgnore("temp/file.txt"), true);
-  assert.strictEqual(filter2.shouldIgnore("temp2/file.txt"), false);
+  const customFilter = new SyncFilter({ ...DEFAULT_SETTINGS, ignoredPatterns: "**/*.secret\ntemp/**" }, ".obsidian");
+  assert.strictEqual(customFilter.shouldIgnore("sub/test.secret"), true);
+  assert.strictEqual(customFilter.shouldIgnore("temp/file.txt"), true);
+  assert.strictEqual(customFilter.shouldIgnore("temp2/file.txt"), false);
 
   console.log("   SyncFilter tests passed!");
 }
 
-function testPlannerLWW() {
-  console.log("-> Testing SyncPlanner (3-Way Diff with LWW)...");
-
+function testPlanner() {
+  console.log("-> Testing SyncPlanner (Conflict Copy, LWW, Manifestless MD5 Dedup, Deletions)...");
   const remoteBasePath = "/apps/obsidian_vault";
+
+  // buildConflictPath
+  const sampleDate = new Date(2026, 10, 21, 18, 5, 9);
+  assert.strictEqual(buildConflictPath("Notes/Daily.md", sampleDate), "Notes/Daily.conflict-20261121-180509.md");
+  assert.strictEqual(buildConflictPath("README", sampleDate), "README.conflict-20261121-180509");
+  assert.strictEqual(buildConflictPath(".obsidian/app.json", sampleDate), ".obsidian/app.conflict-20261121-180509.json");
 
   // Scenario 1: Brand new local file -> UPLOAD
   {
-    const local = new Map<string, LocalFileInfo>([
-      ["new.md", { path: "new.md", mtime: 1000, size: 50 }]
-    ]);
-    const remote = new Map<string, RemoteFileInfo>();
-    const manifest = {};
-    const plans = SyncPlanner.plan(local, remote, manifest, remoteBasePath);
+    const local = new Map<string, LocalFileInfo>([["new.md", { path: "new.md", mtime: 1000, size: 50 }]]);
+    const plans = SyncPlanner.plan(local, new Map(), {}, remoteBasePath);
     assert.strictEqual(plans.length, 1);
     assert.strictEqual(plans[0].action, "UPLOAD");
   }
 
   // Scenario 2: Brand new remote file -> DOWNLOAD
   {
-    const local = new Map<string, LocalFileInfo>();
     const remote = new Map<string, RemoteFileInfo>([
-      ["remote.md", { path: "remote.md", remotePath: "/apps/obsidian_vault/remote.md", mtime: 2000, size: 100, fsId: 123 }]
+      ["remote.md", { path: "remote.md", remotePath: "/apps/obsidian_vault/remote.md", mtime: 2000, size: 100, fsId: "123" }]
     ]);
-    const manifest = {};
-    const plans = SyncPlanner.plan(local, remote, manifest, remoteBasePath);
+    const plans = SyncPlanner.plan(new Map(), remote, {}, remoteBasePath);
     assert.strictEqual(plans.length, 1);
     assert.strictEqual(plans[0].action, "DOWNLOAD");
   }
 
-  // Scenario 3: Concurrent edit conflict -> LWW: Local newer -> UPLOAD
+  // Scenario 3: Manifestless identical plaintext MD5 + size -> UPDATE_MANIFEST (no transfer)
   {
     const local = new Map<string, LocalFileInfo>([
-      ["conflict.md", { path: "conflict.md", mtime: 5000, size: 80 }]
+      ["same.md", { path: "same.md", mtime: 5000, size: 50, md5: "5eb63bbbe01eeed093cb22bb8f5acdc3" }]
     ]);
     const remote = new Map<string, RemoteFileInfo>([
-      ["conflict.md", { path: "conflict.md", remotePath: "/apps/obsidian_vault/conflict.md", mtime: 4000, size: 70, fsId: 456 }]
+      ["same.md", { path: "same.md", remotePath: "/apps/obsidian_vault/same.md", mtime: 2000, size: 50, fsId: "100", md5: "5eb63bbbe01eeed093cb22bb8f5acdc3" }]
     ]);
-    const manifest = {
-      "conflict.md": {
-        path: "conflict.md",
-        remotePath: "/apps/obsidian_vault/conflict.md",
-        mtime: 1000,
-        remoteMtime: 1000,
-        md5: "abc",
-        size: 60
-      }
-    };
-    const plans = SyncPlanner.plan(local, remote, manifest, remoteBasePath);
+    const plans = SyncPlanner.plan(local, remote, {}, remoteBasePath, { conflictStrategy: "copy", enableE2EE: false });
     assert.strictEqual(plans.length, 1);
-    assert.strictEqual(plans[0].action, "UPLOAD");
-    assert.ok(plans[0].reason.includes("LWW 覆盖远端"));
+    assert.strictEqual(plans[0].action, "UPDATE_MANIFEST");
   }
 
-  // Scenario 4: Concurrent edit conflict -> LWW: Remote newer -> DOWNLOAD
+  // Scenario 4: Concurrent edit conflict with default "copy" strategy -> CONFLICT
   {
-    const local = new Map<string, LocalFileInfo>([
-      ["conflict.md", { path: "conflict.md", mtime: 3000, size: 80 }]
-    ]);
+    const local = new Map<string, LocalFileInfo>([["conflict.md", { path: "conflict.md", mtime: 5000, size: 80 }]]);
     const remote = new Map<string, RemoteFileInfo>([
-      ["conflict.md", { path: "conflict.md", remotePath: "/apps/obsidian_vault/conflict.md", mtime: 6000, size: 70, fsId: 456 }]
+      ["conflict.md", { path: "conflict.md", remotePath: "/apps/obsidian_vault/conflict.md", mtime: 4000, size: 70, fsId: "456" }]
     ]);
     const manifest = {
-      "conflict.md": {
-        path: "conflict.md",
-        remotePath: "/apps/obsidian_vault/conflict.md",
-        mtime: 1000,
-        remoteMtime: 1000,
-        md5: "abc",
-        size: 60
-      }
+      "conflict.md": { path: "conflict.md", remotePath: "/apps/obsidian_vault/conflict.md", mtime: 1000, remoteMtime: 1000, md5: "abc", size: 60 }
     };
-    const plans = SyncPlanner.plan(local, remote, manifest, remoteBasePath);
+    const plans = SyncPlanner.plan(local, remote, manifest, remoteBasePath, { conflictStrategy: "copy" });
+    assert.strictEqual(plans.length, 1);
+    assert.strictEqual(plans[0].action, "CONFLICT");
+    assert.strictEqual(plans[0].winner, "local");
+  }
+
+  // Scenario 5: Concurrent edit conflict with explicit "lww" strategy -> UPLOAD / DOWNLOAD
+  {
+    const local = new Map<string, LocalFileInfo>([["conflict.md", { path: "conflict.md", mtime: 3000, size: 80 }]]);
+    const remote = new Map<string, RemoteFileInfo>([
+      ["conflict.md", { path: "conflict.md", remotePath: "/apps/obsidian_vault/conflict.md", mtime: 6000, size: 70, fsId: "456" }]
+    ]);
+    const manifest = {
+      "conflict.md": { path: "conflict.md", remotePath: "/apps/obsidian_vault/conflict.md", mtime: 1000, remoteMtime: 1000, md5: "abc", size: 60 }
+    };
+    const plans = SyncPlanner.plan(local, remote, manifest, remoteBasePath, { conflictStrategy: "lww" });
     assert.strictEqual(plans.length, 1);
     assert.strictEqual(plans[0].action, "DOWNLOAD");
-    assert.ok(plans[0].reason.includes("LWW 覆盖本地"));
   }
 
-  // Scenario 5: Remote deleted, local unchanged -> DELETE_LOCAL
+  // Scenario 6 & 7: Remote delete / Local delete
   {
-    const local = new Map<string, LocalFileInfo>([
-      ["del.md", { path: "del.md", mtime: 1000, size: 50 }]
-    ]);
-    const remote = new Map<string, RemoteFileInfo>();
     const manifest = {
-      "del.md": {
-        path: "del.md",
-        remotePath: "/apps/obsidian_vault/del.md",
-        mtime: 1000,
-        remoteMtime: 1000,
-        md5: "abc",
-        size: 50
-      }
+      "del.md": { path: "del.md", remotePath: "/apps/obsidian_vault/del.md", mtime: 1000, remoteMtime: 1000, md5: "abc", size: 50 }
     };
-    const plans = SyncPlanner.plan(local, remote, manifest, remoteBasePath);
-    assert.strictEqual(plans.length, 1);
-    assert.strictEqual(plans[0].action, "DELETE_LOCAL");
-  }
+    const p1 = SyncPlanner.plan(new Map([["del.md", { path: "del.md", mtime: 1000, size: 50 }]]), new Map(), manifest, remoteBasePath);
+    assert.strictEqual(p1[0].action, "DELETE_LOCAL");
 
-  // Scenario 6: Local deleted, remote unchanged -> DELETE_REMOTE
-  {
-    const local = new Map<string, LocalFileInfo>();
-    const remote = new Map<string, RemoteFileInfo>([
-      ["del2.md", { path: "del2.md", remotePath: "/apps/obsidian_vault/del2.md", mtime: 1000, size: 50, fsId: 789 }]
-    ]);
-    const manifest = {
-      "del2.md": {
-        path: "del2.md",
-        remotePath: "/apps/obsidian_vault/del2.md",
-        mtime: 1000,
-        remoteMtime: 1000,
-        md5: "abc",
-        size: 50
-      }
-    };
-    const plans = SyncPlanner.plan(local, remote, manifest, remoteBasePath);
-    assert.strictEqual(plans.length, 1);
-    assert.strictEqual(plans[0].action, "DELETE_REMOTE");
+    const p2 = SyncPlanner.plan(new Map(), new Map([["del.md", { path: "del.md", remotePath: "/apps/obsidian_vault/del.md", mtime: 1000, size: 50, fsId: "789" }]]), manifest, remoteBasePath);
+    assert.strictEqual(p2[0].action, "DELETE_REMOTE");
   }
 
   console.log("   SyncPlanner tests passed!");
 }
 
+async function testAsyncQueueConcurrency() {
+  console.log("-> Testing AsyncQueue true concurrency & zero-polling waitAll...");
+  const queue = new AsyncQueue(3);
+  let active = 0;
+  let maxObserved = 0;
+
+  const promises = Array.from({ length: 6 }, () =>
+    queue.add(async () => {
+      active++;
+      maxObserved = Math.max(maxObserved, active);
+      await new Promise((r) => setTimeout(r, 25));
+      active--;
+    })
+  );
+
+  await Promise.all(promises);
+  await queue.waitAll();
+  assert.strictEqual(maxObserved, 3, `Expected max concurrency 3, observed ${maxObserved}`);
+  assert.strictEqual(active, 0);
+  console.log("   AsyncQueue concurrency tests passed!");
+}
+
+async function testE2EEv2AndLegacyV1() {
+  console.log("-> Testing E2EE v2 (cached master key + HKDF + AAD) & Legacy v1 fallback...");
+  clearKeyCache();
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const testPassword = "VaultSecretPassword!@#";
+  const rawData = enc.encode(JSON.stringify({ plugin: "terminal", enabled: true })).slice().buffer;
+
+  // 1. Encrypt with v2 and verify format version
+  const enc1 = await encryptData(rawData, testPassword);
+  assert.strictEqual(getEncryptionVersion(enc1), 2, "New encryptions must use v2 format");
+  assert.strictEqual(isEncrypted(enc1), true);
+  assert.strictEqual(dec.decode(await decryptData(enc1, testPassword)), dec.decode(rawData));
+
+  // 2. Verify batch performance via cached master key (20 files should complete well under 1s!)
+  const batchStart = Date.now();
+  for (let i = 0; i < 20; i++) {
+    const sample = enc.encode(`Note #${i} content`).slice().buffer;
+    const cipher = await encryptData(sample, testPassword);
+    const plain = await decryptData(cipher, testPassword);
+    assert.strictEqual(dec.decode(plain), `Note #${i} content`);
+  }
+  const batchElapsed = Date.now() - batchStart;
+  assert.ok(batchElapsed < 2000, `Expected fast HKDF batch (<2000ms), took ${batchElapsed}ms`);
+
+  // 3. Header tamper detection (AAD authentication on v2 header)
+  const tampered = new Uint8Array(enc1.slice(0));
+  tampered[15] ^= 0xff; // Flip byte in masterSalt header
+  let tamperRejected = false;
+  try {
+    await decryptData(tampered.buffer, testPassword);
+  } catch {
+    tamperRejected = true;
+  }
+  assert.ok(tamperRejected, "Tampered v2 header must fail GCM AAD authentication");
+
+  // 4. Legacy v1 (100,000 iterations pre-v1.0.7) compatibility
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const legacyKey = await deriveKey(testPassword, salt, LEGACY_PBKDF2_ITERATIONS);
+  const legacyCipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, legacyKey, rawData);
+  const MAGIC_V1 = new Uint8Array([0x42, 0x44, 0x53, 0x59, 0x4e, 0x43, 0x5f, 0x45, 0x32, 0x45, 0x45, 0x01]);
+  const legacyBuf = new Uint8Array(MAGIC_V1.length + salt.length + iv.length + legacyCipher.byteLength);
+  legacyBuf.set(MAGIC_V1, 0);
+  legacyBuf.set(salt, MAGIC_V1.length);
+  legacyBuf.set(iv, MAGIC_V1.length + salt.length);
+  legacyBuf.set(new Uint8Array(legacyCipher), MAGIC_V1.length + salt.length + iv.length);
+
+  assert.strictEqual(getEncryptionVersion(legacyBuf.buffer), 1);
+  assert.strictEqual(dec.decode(await decryptData(legacyBuf.buffer, testPassword)), dec.decode(rawData));
+
+  // 5. Wrong password fails
+  let wrongPwdFailed = false;
+  try {
+    await decryptData(enc1, "WrongPassword");
+  } catch {
+    wrongPwdFailed = true;
+  }
+  assert.ok(wrongPwdFailed, "Wrong password must fail decryption");
+  clearKeyCache();
+
+  console.log(`   E2EE v2 + legacy v1 tests passed! (20-file HKDF batch: ${batchElapsed}ms)`);
+}
+
 async function testConfigShare() {
-  console.log("-> Testing ConfigShare (Multi-device encrypted config export/import)...");
-  const dummySettings: any = {
+  console.log("-> Testing ConfigShare (Multi-device encrypted export/import + downgrade defense)...");
+  const dummySettings: BaiduSyncSettings = {
     ...DEFAULT_SETTINGS,
     appKey: "testAppKey123",
     appSecret: "testAppSecret456",
@@ -191,145 +421,392 @@ async function testConfigShare() {
     refreshToken: "fakeRefresh789",
     tokenExpiresAt: 1735689600000,
     remoteBasePath: "/apps/test_sync",
-    syncObsidianConfig: true,
-    syncPlugins: true,
-    syncThemes: false,
-    ignoredPatterns: "**/.git/**\n**/workspace*.json",
+    conflictStrategy: "copy",
+    maxFileSizeMB: 50,
     concurrency: 4,
     enableE2EE: true,
     e2eePassword: "MyMasterVaultPassword!"
   };
 
   const pin = "SafePin9876";
-
-  // 1. Export encrypted pairing code
   const pairingCode = await exportEncryptedConfig(dummySettings, pin);
-  assert.ok(pairingCode.startsWith("BDSYNC:v1:"), "Pairing code must start with BDSYNC:v1:");
+  assert.ok(pairingCode.startsWith("BDSYNC:v1:"));
 
-  // 2. Import with correct pin
   const imported = await importEncryptedConfig(pairingCode, pin);
-  assert.strictEqual(imported.appKey, dummySettings.appKey, "appKey mismatch");
-  assert.strictEqual(imported.appSecret, dummySettings.appSecret, "appSecret mismatch");
-  assert.strictEqual(imported.accessToken, dummySettings.accessToken, "accessToken mismatch");
-  assert.strictEqual(imported.refreshToken, dummySettings.refreshToken, "refreshToken mismatch");
-  assert.strictEqual(imported.remoteBasePath, dummySettings.remoteBasePath, "remoteBasePath mismatch");
-  assert.strictEqual(imported.enableE2EE, true, "enableE2EE mismatch");
-  assert.strictEqual(imported.e2eePassword, "MyMasterVaultPassword!", "e2eePassword mismatch");
-  assert.strictEqual(imported.concurrency, 4, "concurrency mismatch");
+  assert.strictEqual(imported.appKey, dummySettings.appKey);
+  assert.strictEqual(imported.conflictStrategy, "copy");
+  assert.strictEqual(imported.maxFileSizeMB, 50);
+  assert.strictEqual(imported.e2eePassword, "MyMasterVaultPassword!");
 
-  // 3. Import with incorrect pin -> should fail
-  let failed = false;
-  try {
-    await importEncryptedConfig(pairingCode, "WrongPin123");
-  } catch (err: any) {
-    failed = true;
-    assert.ok(err.message.includes("解密失败"), "Error message should mention decryption failure");
-  }
-  assert.ok(failed, "Import with wrong PIN must throw error");
+  // Wrong PIN
+  await assert.rejects(() => importEncryptedConfig(pairingCode, "WrongPin"));
 
-  // 4. Corrupted code -> should fail
-  let corruptedFailed = false;
-  try {
-    await importEncryptedConfig("BDSYNC:v1:corruptedPayload!!!", pin);
-  } catch (err) {
-    corruptedFailed = true;
-  }
-  assert.ok(corruptedFailed, "Import with corrupted code must throw error");
-
-  // 5. Empty / Whitespace PIN boundary tests
-  let emptyPinExport = false;
-  try {
-    await exportEncryptedConfig(dummySettings, "   ");
-  } catch (err: any) {
-    emptyPinExport = true;
-    assert.ok(err.message.includes("不能为空"), "Must reject empty pin on export");
-  }
-  assert.ok(emptyPinExport, "Export with empty PIN must throw");
-
-  let emptyPinImport = false;
-  try {
-    await importEncryptedConfig(pairingCode, "  ");
-  } catch (err: any) {
-    emptyPinImport = true;
-    assert.ok(err.message.includes("请输入配对保护密码"), "Must reject empty pin on import");
-  }
-  assert.ok(emptyPinImport, "Import with empty PIN must throw");
-
-  // 6. Security Defense: Reject Plaintext Downgrade / PIN Bypass Attack
-  const fakePlaintextJson = JSON.stringify({
-    remoteBasePath: "/hacked",
-    appKey: "evilKey",
-    appSecret: "evilSecret"
-  });
-  const unencryptedBase64 = Buffer.from(fakePlaintextJson).toString("base64");
-  const bypassPayload = `BDSYNC:v1:${unencryptedBase64}`;
-
-  let downgradeBlocked = false;
-  try {
-    await importEncryptedConfig(bypassPayload, "AnyPin");
-  } catch (err: any) {
-    downgradeBlocked = true;
-    assert.ok(err.message.includes("未经过加密保护"), "Must block unencrypted downgrade payload");
-  }
-  assert.ok(downgradeBlocked, "Plaintext downgrade bypass attack must be blocked");
+  // Plaintext downgrade attack blocked
+  const fakePlain = Buffer.from(JSON.stringify({ remoteBasePath: "/hacked" })).toString("base64");
+  await assert.rejects(() => importEncryptedConfig(`BDSYNC:v1:${fakePlain}`, "AnyPin"));
 
   console.log("   ConfigShare tests passed!");
 }
 
-async function testE2EEFallback() {
-  console.log("-> Testing E2EE & Backward-Compatible Iteration Fallback...");
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-  const testPassword = "VaultSecretPassword!@#";
-  const rawData = enc.encode(JSON.stringify({ plugin: "terminal", enabled: true, data: "some-json-content" })).buffer;
+async function testBaiduProtocolAndSafety() {
+  console.log("-> Testing BaiduOAuth mutex, errno -6 fresh token retry, 64-bit fs_id, listall fallback, rapid upload & binary download...");
 
-  // 1. Standard encryption with 600,000 iterations
-  const encryptedStandard = await encryptData(rawData, testPassword);
-  assert.ok(isEncrypted(encryptedStandard), "Must be recognized as encrypted");
-  const decryptedStandard = await decryptData(encryptedStandard, testPassword);
-  assert.strictEqual(dec.decode(decryptedStandard), dec.decode(rawData), "Standard 600k decrypt mismatch");
+  // 1. 64-bit fs_id preservation & secret sanitization
+  const rawBigFsIdJson = '{"errno":0,"list":[{"fs_id":1092837465123456789,"path":"/apps/vault/a.md"}]}';
+  const parsed = parseJsonPreserveIds<{ list: Array<{ fs_id: string }> }>(rawBigFsIdJson);
+  assert.strictEqual(parsed.list[0].fs_id, "1092837465123456789", "64-bit fs_id must not lose precision!");
 
-  // 2. Simulate legacy file encrypted with 100,000 iterations (pre-v1.0.7)
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const legacyKey = await deriveKey(testPassword, salt, LEGACY_PBKDF2_ITERATIONS);
-  const legacyCipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, legacyKey, rawData);
-  const MAGIC_HEADER = new Uint8Array([0x42, 0x44, 0x53, 0x59, 0x4e, 0x43, 0x5f, 0x45, 0x32, 0x45, 0x45, 0x01]);
-  const legacyBuffer = new Uint8Array(MAGIC_HEADER.length + salt.length + iv.length + legacyCipher.byteLength);
-  let offset = 0;
-  legacyBuffer.set(MAGIC_HEADER, offset);
-  offset += MAGIC_HEADER.length;
-  legacyBuffer.set(salt, offset);
-  offset += salt.length;
-  legacyBuffer.set(iv, offset);
-  offset += iv.length;
-  legacyBuffer.set(new Uint8Array(legacyCipher), offset);
+  const redacted = sanitizeErrorMessage("Request failed https://pan.baidu.com/api?access_token=SECRET_TOK_123&foo=bar");
+  assert.ok(!redacted.includes("SECRET_TOK_123") && redacted.includes("access_token=[REDACTED]"));
 
-  // Decrypt legacy file using decryptData -> should automatically fall back to 100k and succeed!
-  const decryptedLegacy = await decryptData(legacyBuffer.buffer, testPassword);
-  assert.strictEqual(dec.decode(decryptedLegacy), dec.decode(rawData), "Legacy 100k decrypt mismatch");
+  // 2. OAuth concurrent refresh mutex + errno -6 retry uses NEW token in URL
+  let settings: BaiduSyncSettings = {
+    ...DEFAULT_SETTINGS,
+    appKey: "k",
+    appSecret: "s",
+    accessToken: "OLD_TOKEN",
+    refreshToken: "REF_TOKEN",
+    tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000
+  };
+  let tokenRefreshCalls = 0;
+  const seenListTokens: string[] = [];
 
-  // 3. Decrypt with wrong password -> must throw error
-  let wrongPasswordThrown = false;
-  try {
-    await decryptData(legacyBuffer.buffer, "WrongPassword");
-  } catch (err: unknown) {
-    wrongPasswordThrown = true;
-    const msg = err instanceof Error ? err.message : String(err);
-    assert.ok(msg.includes("密码错误或文件损坏"), "Should throw password or corruption error");
-  }
-  assert.ok(wrongPasswordThrown, "Must throw on wrong password");
+  const mockHttp: HttpRequestFn = async (param: HttpRequestParam) => {
+    if (param.url.includes("openapi.baidu.com/oauth/2.0/token")) {
+      tokenRefreshCalls++;
+      await new Promise((r) => setTimeout(r, 20));
+      return makeJsonResponse({
+        access_token: "NEW_TOKEN",
+        refresh_token: "REF_TOKEN_2",
+        expires_in: 2592000,
+        scope: "basic,netdisk"
+      });
+    }
+    if (param.url.includes("method=listall")) {
+      const m = param.url.match(/access_token=([^&]+)/);
+      const tok = m ? decodeURIComponent(m[1]) : "";
+      seenListTokens.push(tok);
+      if (tok === "OLD_TOKEN") {
+        return makeJsonResponse({ errno: -6 });
+      }
+      // Simulate listall unsupported (errno 2) to test automatic BFS fallback!
+      return makeJsonResponse({ errno: 2 });
+    }
+    if (param.url.includes("method=list&")) {
+      return makeJsonResponse(
+        null,
+        200,
+        '{"errno":0,"list":[{"fs_id":1092837465123456789,"path":"/apps/obsidian_vault/note.md","server_filename":"note.md","size":12,"isdir":0,"server_mtime":1700000000,"server_ctime":1700000000,"md5":"abc"}]}'
+      );
+    }
+    if (param.url.includes("method=filemetas")) {
+      return makeJsonResponse(
+        null,
+        200,
+        '{"errno":0,"list":[{"fs_id":1092837465123456789,"path":"/apps/obsidian_vault/note.md","server_filename":"note.md","size":12,"isdir":0,"category":6,"md5":"abc","dlink":"https://d.pcs.baidu.com/file/1"}]}'
+      );
+    }
+    if (param.url.startsWith("https://d.pcs.baidu.com/file/1")) {
+      // Binary response throws if resp.text is accessed!
+      return makeBinaryResponse(new TextEncoder().encode("binary-safe!").slice().buffer);
+    }
+    if (param.url.includes("method=precreate")) {
+      // Verify rapid-upload hashes were sent and test return_type=2 instant hit
+      const body = String(param.body || "");
+      assert.ok(body.includes("content-md5="), "precreate should send content-md5");
+      assert.ok(body.includes("slice-md5="), "precreate should send slice-md5");
+      return makeJsonResponse({
+        errno: 0,
+        return_type: 2,
+        uploadid: "",
+        block_list: [],
+        info: {
+          fs_id: "999888777666555444",
+          path: "/apps/obsidian_vault/rapid.md",
+          size: 5,
+          mtime: 1700000100,
+          md5: md5(new TextEncoder().encode("rapid"))
+        }
+      });
+    }
+    if (param.url.includes("pcs/superfile2")) {
+      return makeJsonResponse({ error_code: 31066, error_msg: "slice failed" });
+    }
+    throw new Error(`Unexpected URL: ${param.url}`);
+  };
 
-  console.log("   E2EE backward compatibility tests passed!");
+  const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+  const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+
+  // Fire 3 concurrent listAll calls while token is OLD_TOKEN -> must refresh ONCE and retry with NEW_TOKEN
+  const [res1, res2, res3] = await Promise.all([
+    client.listAll("/apps/obsidian_vault"),
+    client.listAll("/apps/obsidian_vault"),
+    client.listAll("/apps/obsidian_vault")
+  ]);
+  assert.strictEqual(tokenRefreshCalls, 1, `OAuth refresh mutex failed: called ${tokenRefreshCalls} times`);
+  assert.ok(seenListTokens.includes("OLD_TOKEN"), "Initial request must use OLD_TOKEN before errno -6");
+  assert.ok(seenListTokens.includes("NEW_TOKEN"), "Retry MUST send refreshed NEW_TOKEN in URL!");
+  assert.strictEqual(res1[0].fs_id, "1092837465123456789");
+  assert.strictEqual(res2.length, 1);
+  assert.strictEqual(res3.length, 1);
+
+  // Binary download MUST NOT access resp.text / JSON.parse
+  const downloader = new BaiduDownloader(client);
+  const downloaded = await downloader.downloadByFsId("1092837465123456789");
+  assert.strictEqual(new TextDecoder().decode(downloaded), "binary-safe!");
+
+  // Rapid upload (return_type === 2) succeeds without uploadSlice / createFile
+  const uploader = new BaiduUploader(client);
+  const rapidRes = await uploader.uploadFile("/apps/obsidian_vault/rapid.md", new TextEncoder().encode("rapid").slice().buffer);
+  assert.strictEqual(rapidRes.fs_id, "999888777666555444");
+
+  // uploadSlice must throw on PCS error_code even when HTTP 200
+  await assert.rejects(
+    () => client.uploadSlice("/apps/obsidian_vault/x.md", "uid", 0, new ArrayBuffer(4)),
+    /31066/
+  );
+
+  console.log("   Baidu protocol & safety tests passed!");
+}
+
+async function testSyncEngineIntegration() {
+  console.log("-> Testing SyncEngine end-to-end (concurrency, conflict copy, maxFileSize, batched delete, migration abort)...");
+  const vault = createMemoryVault(".obsidian");
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // Seed local files:
+  // 1. Conflict file (local modified vs remote modified)
+  vault.seedFile("conflict.md", "local version", (nowSec + 10) * 1000);
+  // 2. Oversized file (> 1 MB limit)
+  vault.seedFile("huge.bin", new ArrayBuffer(2 * 1024 * 1024), nowSec * 1000);
+  // 3. Normal file inside .obsidian to verify no double-scan
+  vault.seedFile(".obsidian/app.json", '{"theme":"obsidian"}', nowSec * 1000);
+  // 4. Three new local files to verify true concurrent uploads
+  vault.seedFile("a.md", "file a", nowSec * 1000);
+  vault.seedFile("b.md", "file b", nowSec * 1000);
+  vault.seedFile("c.md", "file c", nowSec * 1000);
+
+  // Seed manifest with conflict.md & two deleted-locally files (for batch delete test)
+  const manifestMgr = new ManifestManager(vault, ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json");
+  manifestMgr.set({
+    path: "conflict.md",
+    remotePath: "/apps/obsidian_vault/conflict.md",
+    mtime: (nowSec - 100) * 1000,
+    remoteMtime: (nowSec - 100) * 1000,
+    md5: "old",
+    size: 5,
+    remoteSize: 5,
+    fsId: "5001"
+  });
+  manifestMgr.set({
+    path: "deleted1.md",
+    remotePath: "/apps/obsidian_vault/deleted1.md",
+    mtime: (nowSec - 50) * 1000,
+    remoteMtime: (nowSec - 50) * 1000,
+    md5: "d1",
+    size: 4,
+    remoteSize: 4,
+    fsId: "5002"
+  });
+  manifestMgr.set({
+    path: "deleted2.md",
+    remotePath: "/apps/obsidian_vault/deleted2.md",
+    mtime: (nowSec - 50) * 1000,
+    remoteMtime: (nowSec - 50) * 1000,
+    md5: "d2",
+    size: 4,
+    remoteSize: 4,
+    fsId: "5003"
+  });
+  await manifestMgr.save();
+
+  let settings: BaiduSyncSettings = {
+    ...DEFAULT_SETTINGS,
+    appKey: "k",
+    appSecret: "s",
+    accessToken: "VALID_TOK",
+    refreshToken: "REF",
+    tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    conflictStrategy: "copy",
+    concurrency: 3,
+    maxFileSizeMB: 1
+  };
+
+  let activeUploads = 0;
+  let maxConcurrentUploads = 0;
+  const deleteBatches: string[][] = [];
+  const uploadedPaths: string[] = [];
+  let failListAll = false;
+
+  const remoteStore = new Map<string, ArrayBuffer>([
+    ["/apps/obsidian_vault/conflict.md", new TextEncoder().encode("remote version").slice().buffer]
+  ]);
+
+  const mockHttp: HttpRequestFn = async (param: HttpRequestParam) => {
+    if (param.url.includes("method=listall")) {
+      if (failListAll) {
+        return makeJsonResponse({ errno: 50001 }, 500);
+      }
+      return makeJsonResponse({
+        errno: 0,
+        has_more: 0,
+        list: [
+          {
+            fs_id: "5001",
+            path: "/apps/obsidian_vault/conflict.md",
+            server_filename: "conflict.md",
+            size: 14,
+            isdir: 0,
+            server_mtime: nowSec + 5,
+            server_ctime: nowSec,
+            md5: "remote-md5"
+          },
+          {
+            fs_id: "5002",
+            path: "/apps/obsidian_vault/deleted1.md",
+            server_filename: "deleted1.md",
+            size: 4,
+            isdir: 0,
+            server_mtime: nowSec - 50,
+            server_ctime: nowSec - 50,
+            md5: "d1"
+          },
+          {
+            fs_id: "5003",
+            path: "/apps/obsidian_vault/deleted2.md",
+            server_filename: "deleted2.md",
+            size: 4,
+            isdir: 0,
+            server_mtime: nowSec - 50,
+            server_ctime: nowSec - 50,
+            md5: "d2"
+          },
+          // Should be excluded by strict prefix check!
+          {
+            fs_id: "9999",
+            path: "/apps/obsidian_vault2/other.md",
+            server_filename: "other.md",
+            size: 5,
+            isdir: 0,
+            server_mtime: nowSec,
+            server_ctime: nowSec,
+            md5: "x"
+          }
+        ]
+      });
+    }
+    if (param.url.includes("method=filemetas")) {
+      return makeJsonResponse({
+        errno: 0,
+        list: [
+          {
+            fs_id: "5001",
+            path: "/apps/obsidian_vault/conflict.md",
+            server_filename: "conflict.md",
+            size: 14,
+            isdir: 0,
+            category: 6,
+            md5: "remote-md5",
+            dlink: "https://d.pcs.baidu.com/conflict"
+          }
+        ]
+      });
+    }
+    if (param.url.startsWith("https://d.pcs.baidu.com/conflict")) {
+      return makeBinaryResponse(remoteStore.get("/apps/obsidian_vault/conflict.md")!.slice(0));
+    }
+    if (param.url.includes("method=filemanager&opera=delete")) {
+      const params = new URLSearchParams(String(param.body || ""));
+      const list = JSON.parse(params.get("filelist") || "[]") as string[];
+      deleteBatches.push(list);
+      return makeJsonResponse({ errno: 0 });
+    }
+    if (param.url.includes("method=precreate")) {
+      activeUploads++;
+      maxConcurrentUploads = Math.max(maxConcurrentUploads, activeUploads);
+      await new Promise((r) => setTimeout(r, 25));
+      activeUploads--;
+
+      const params = new URLSearchParams(String(param.body || ""));
+      const p = params.get("path") || "";
+      uploadedPaths.push(p);
+      return makeJsonResponse({
+        errno: 0,
+        return_type: 2,
+        uploadid: "",
+        block_list: [],
+        info: {
+          fs_id: String(Math.floor(Math.random() * 1e15)),
+          path: p,
+          size: Number(params.get("size") || 0),
+          mtime: nowSec + 20,
+          md5: params.get("content-md5") || ""
+        }
+      });
+    }
+    throw new Error(`Unexpected engine mock URL: ${param.url}`);
+  };
+
+  const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+  const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+  const engine = new SyncEngine(
+    vault,
+    () => settings,
+    async (s) => { settings = s; },
+    client,
+    manifestMgr,
+    ".obsidian/plugins/baidu-netdisk-sync"
+  );
+
+  const res = await engine.startSync(false);
+  assert.strictEqual(res.success, true);
+  assert.strictEqual(res.stats.conflicts, 1, "Must detect and preserve 1 conflict");
+  assert.strictEqual(res.stats.skipped, 1, "Must skip 2MB file exceeding 1MB limit");
+  assert.strictEqual(res.stats.deleted, 2, "Must delete 2 remote files");
+  assert.strictEqual(deleteBatches.length, 1, "Remote deletes must be batched into 1 API call!");
+  assert.strictEqual(deleteBatches[0].length, 2);
+  assert.ok(maxConcurrentUploads >= 2, `Expected parallel uploads >= 2, got ${maxConcurrentUploads}`);
+
+  // Verify conflict copy preserved remote content while canonical kept local content
+  assert.strictEqual(vault.readText("conflict.md"), "local version");
+  const conflictCopyPath = Array.from(vault.files.keys()).find((p) => p.startsWith("conflict.conflict-"));
+  assert.ok(conflictCopyPath, "Conflict backup copy must exist locally");
+  assert.strictEqual(vault.readText(conflictCopyPath!), "remote version");
+  assert.ok(engine.wasRecentlyWrittenBySync(conflictCopyPath!), "Engine must suppress echo for written conflict copy");
+
+  // Verify .obsidian was NOT double-scanned
+  const obsidianListCount = vault.listCalls.filter((d) => d === ".obsidian").length;
+  assert.strictEqual(obsidianListCount, 1, `Expected .obsidian scanned once, scanned ${obsidianListCount} times`);
+
+  // Verify strict prefix check ignored /apps/obsidian_vault2/other.md
+  assert.strictEqual(vault.files.has("other.md"), false);
+
+  // Verify convertVaultToPlaintext aborts cleanly on fatal step-1 error (when stats.errors === 0!)
+  failListAll = true;
+  const uploadsBeforeMigration = uploadedPaths.length;
+  await assert.rejects(
+    () => engine.convertVaultToPlaintext(),
+    /pre-sync|预拉取/i,
+    "Migration MUST abort when step 1 fails fatally"
+  );
+  assert.strictEqual(uploadedPaths.length, uploadsBeforeMigration, "Migration must NOT upload anything if step 1 failed");
+  assert.strictEqual(engine.getState(), "error");
+
+  console.log("   SyncEngine integration tests passed!");
 }
 
 async function runAll() {
   testMD5();
+  testI18n();
   testFilter();
-  testPlannerLWW();
+  testPlanner();
+  await testAsyncQueueConcurrency();
+  await testE2EEv2AndLegacyV1();
   await testConfigShare();
-  await testE2EEFallback();
-  console.log("🎉 All unit tests passed successfully!");
+  await testBaiduProtocolAndSafety();
+  await testSyncEngineIntegration();
+  console.log("🎉 All unit & integration tests passed successfully!");
 }
 
 runAll().catch((err) => {

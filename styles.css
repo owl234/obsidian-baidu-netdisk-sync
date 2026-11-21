@@ -48,6 +48,10 @@
     color: var(--text-error);
 }
 
+.baidu-sync-log-row.warn {
+    color: var(--text-warning);
+}
+
 .baidu-sync-log-row.success {
     color: var(--text-success);
 }

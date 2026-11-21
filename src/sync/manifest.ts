@@ -1,4 +1,9 @@
-import { DataAdapter } from "obsidian";
+export interface ManifestStorageAdapter {
+  exists(path: string): Promise<boolean>;
+  mkdir(path: string): Promise<void>;
+  read(path: string): Promise<string>;
+  write(path: string, data: string): Promise<void>;
+}
 
 export interface ManifestItem {
   path: string;           // Local relative path, e.g. "Folder/Note.md"
@@ -7,7 +12,7 @@ export interface ManifestItem {
   remoteMtime: number;    // Remote server_mtime in milliseconds
   md5: string;            // File MD5
   size: number;           // Local file size in bytes
-  remoteSize?: number;    // Remote file size in bytes (with encryption/overhead)
+  remoteSize?: number;    // Remote file size in bytes (with encryption overhead)
   fsId?: string | number; // Baidu Netdisk fs_id
 }
 
@@ -15,6 +20,17 @@ export interface SyncManifest {
   version: number;
   lastSyncTime: number;
   files: Record<string, ManifestItem>;
+}
+
+async function ensureDirRecursive(adapter: ManifestStorageAdapter, dirPath: string): Promise<void> {
+  const parts = dirPath.split("/").filter(Boolean);
+  let current = "";
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    if (!(await adapter.exists(current))) {
+      await adapter.mkdir(current);
+    }
+  }
 }
 
 export class ManifestManager {
@@ -25,7 +41,7 @@ export class ManifestManager {
   };
 
   constructor(
-    private adapter: DataAdapter,
+    private adapter: ManifestStorageAdapter,
     private manifestFilePath: string
   ) {}
 
@@ -33,13 +49,19 @@ export class ManifestManager {
     try {
       if (await this.adapter.exists(this.manifestFilePath)) {
         const raw = await this.adapter.read(this.manifestFilePath);
-        this.manifest = JSON.parse(raw) as SyncManifest;
-        if (!this.manifest.files) {
-          this.manifest.files = {};
+        const parsed = JSON.parse(raw) as Partial<SyncManifest>;
+        if (parsed && typeof parsed === "object" && parsed.files && typeof parsed.files === "object") {
+          this.manifest = {
+            version: typeof parsed.version === "number" ? parsed.version : 1,
+            lastSyncTime: typeof parsed.lastSyncTime === "number" ? parsed.lastSyncTime : 0,
+            files: parsed.files
+          };
+        } else {
+          this.manifest = { version: 1, lastSyncTime: 0, files: {} };
         }
       }
     } catch (err) {
-      console.warn("[BaiduSync] 加载 sync_manifest 失败，将使用空清单:", err);
+      console.warn("[BaiduSync] Failed to load sync_manifest, starting fresh:", err);
       this.manifest = {
         version: 1,
         lastSyncTime: 0,
@@ -51,20 +73,17 @@ export class ManifestManager {
 
   async save(): Promise<void> {
     try {
-      // Ensure parent directory exists
       const lastSlash = this.manifestFilePath.lastIndexOf("/");
       if (lastSlash > 0) {
         const dir = this.manifestFilePath.substring(0, lastSlash);
-        if (!(await this.adapter.exists(dir))) {
-          await this.adapter.mkdir(dir);
-        }
+        await ensureDirRecursive(this.adapter, dir);
       }
       await this.adapter.write(
         this.manifestFilePath,
         JSON.stringify(this.manifest, null, 2)
       );
     } catch (err) {
-      console.error("[BaiduSync] 保存 sync_manifest 失败:", err);
+      console.error("[BaiduSync] Failed to save sync_manifest:", err);
     }
   }
 

@@ -1,5 +1,7 @@
 import { App, Modal, Setting, Notice } from "obsidian";
 import type BaiduSyncPlugin from "../main";
+import { clearKeyCache } from "../crypto/e2ee";
+import { t } from "../i18n";
 
 export class DecryptMigrationModal extends Modal {
   private plugin: BaiduSyncPlugin;
@@ -15,106 +17,114 @@ export class DecryptMigrationModal extends Modal {
   }
 
   onOpen(): void {
+    this.setTitle(t("modal.migration.title"));
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("baidu-sync-log-modal");
 
-    contentEl.createEl("h2", { text: "🔓 全量解密并转为明文同步" });
-
     const desc = contentEl.createDiv({
-      cls: "setting-item-description baidu-sync-modal-desc",
+      cls: "setting-item-description baidu-sync-modal-desc"
     });
-    desc.setText(
-      "此功能将协助你安全停用 E2EE 端到端加密并恢复为明文同步：\n" +
-      "1. 预拉取校验：自动拉取并解密云端所有文件至本地，确保本地知识库绝对完整；\n" +
-      "2. 明文覆盖上传：以无加密明文全量重新上传本地全部笔记与配置至百度网盘，彻底覆盖历史密文；\n" +
-      "3. 状态收尾：自动关闭【开启端到端加密】开关并更新同步清单。"
-    );
+    desc.setText(t("modal.migration.desc"));
 
     const warnBox = contentEl.createDiv({
-      cls: "setting-item-description baidu-sync-modal-desc baidu-sync-warning-box",
+      cls: "setting-item-description baidu-sync-modal-desc baidu-sync-warning-box"
     });
-    warnBox.setText(
-      "⚠️ 安全提示：迁移完成后，你在百度网盘中的文件将变为可直读的原始明文数据。请确保当前设备已配置正确的 E2EE 解密密码。"
-    );
+    warnBox.setText(t("modal.migration.warning"));
 
     new Setting(contentEl)
-      .setName("迁移成功后清空已保存的密码")
-      .setDesc("默认关闭（建议保留原密码作为防呆备份）。若开启，迁移完成后将同步清空设置中的密码。")
+      .setName(t("modal.migration.clearPwdName"))
+      .setDesc(t("modal.migration.clearPwdDesc"))
       .addToggle((toggle) => {
-        toggle
-          .setValue(this.clearPasswordOnFinish)
-          .onChange((val) => {
-            this.clearPasswordOnFinish = val;
-          });
+        toggle.setValue(this.clearPasswordOnFinish).onChange((val) => {
+          this.clearPasswordOnFinish = val;
+        });
       });
 
     const statusContainer = contentEl.createDiv({ cls: "baidu-sync-migration-status" });
     this.statusTextEl = statusContainer.createDiv({
       cls: "setting-item-description",
-      text: "准备就绪，点击下方按钮开始迁移。"
+      text: t("modal.migration.ready")
     });
+
+    let closeBtnEl: HTMLButtonElement | null = null;
 
     new Setting(contentEl)
       .addButton((btn) => {
         btn
-          .setButtonText("开始解密迁移")
+          .setButtonText(t("modal.migration.startBtn"))
           .setCta()
           .onClick(async () => {
             if (this.isMigrating) return;
             if (!this.plugin.settings.accessToken) {
-              new Notice("请先完成百度网盘账号绑定！");
+              new Notice(t("modal.migration.notAuthorizedNotice"));
               return;
             }
 
             this.isMigrating = true;
             btn.setDisabled(true);
-            btn.setButtonText("迁移处理中...");
+            btn.setButtonText(t("modal.migration.runningBtn"));
+            if (closeBtnEl) closeBtnEl.disabled = true;
 
             try {
               if (this.statusTextEl) {
-                this.statusTextEl.setText("第 1 步：正在拉取并解密云端所有文件以确保本地完整...");
+                this.statusTextEl.setText(t("modal.migration.step1Status"));
               }
 
-              const result = await this.plugin.engine.convertVaultToPlaintext((processed, total, path) => {
-                if (this.statusTextEl) {
-                  this.statusTextEl.setText(`第 2 步：正在明文重新上传覆盖网盘 (${processed}/${total}): ${path}`);
+              const result = await this.plugin.engine.convertVaultToPlaintext(
+                (processed, total, path) => {
+                  if (this.statusTextEl) {
+                    this.statusTextEl.setText(
+                      t("modal.migration.step2Status", { done: processed, total, path })
+                    );
+                  }
                 }
-              });
+              );
 
               if (result.success) {
                 this.plugin.settings.enableE2EE = false;
                 if (this.clearPasswordOnFinish) {
                   this.plugin.settings.e2eePassword = "";
+                  clearKeyCache();
                 }
                 await this.plugin.saveSettings();
 
                 if (this.statusTextEl) {
-                  this.statusTextEl.setText(`🎉 迁移圆满成功！已将 ${result.total} 个文件明文同步至网盘，E2EE 加密已关闭。`);
+                  this.statusTextEl.setText(
+                    t("modal.migration.successStatus", { total: result.total })
+                  );
                 }
-                new Notice("🎉 百度网盘端所有文件已成功转为明文！");
+                new Notice(t("modal.migration.successNotice"));
                 this.onComplete?.();
               } else {
                 if (this.statusTextEl) {
-                  this.statusTextEl.setText(`⚠️ 迁移部分完成，但有 ${result.errors} 个文件失败，请查看同步日志。`);
+                  this.statusTextEl.setText(
+                    t("modal.migration.partialStatus", { errors: result.errors })
+                  );
                 }
-                new Notice(`明文迁移完成，但存在 ${result.errors} 个失败项，请检查日志`);
+                new Notice(t("modal.migration.partialNotice", { errors: result.errors }));
               }
             } catch (err: unknown) {
               const msg = err instanceof Error ? err.message : String(err);
               if (this.statusTextEl) {
-                this.statusTextEl.setText(`❌ 迁移中止: ${msg}`);
+                this.statusTextEl.setText(t("modal.migration.abortedStatus", { msg }));
               }
-              new Notice(`迁移失败: ${msg}`);
+              new Notice(t("modal.migration.failNotice", { msg }));
             } finally {
               this.isMigrating = false;
               btn.setDisabled(false);
-              btn.setButtonText("重新执行迁移");
+              btn.setButtonText(t("modal.migration.retryBtn"));
+              if (closeBtnEl) closeBtnEl.disabled = false;
             }
           });
       })
       .addButton((btn) => {
-        btn.setButtonText("关闭").onClick(() => {
+        closeBtnEl = btn.buttonEl;
+        btn.setButtonText(t("modal.migration.closeBtn")).onClick(() => {
+          if (this.isMigrating) {
+            new Notice(t("modal.migration.runningCloseNotice"));
+            return;
+          }
           this.close();
         });
       });

@@ -1,5 +1,6 @@
 import { encryptData, decryptData, isEncrypted } from "./e2ee";
-import type { BaiduSyncSettings } from "../settings/settings";
+import type { BaiduSyncSettings, ConflictStrategy } from "../settings/settings";
+import { t } from "../i18n";
 
 export interface SharedSyncConfig {
   appKey: string;
@@ -8,16 +9,25 @@ export interface SharedSyncConfig {
   refreshToken: string;
   tokenExpiresAt: number;
   remoteBasePath: string;
+  conflictStrategy?: ConflictStrategy;
   syncObsidianConfig: boolean;
   syncPlugins: boolean;
   syncThemes: boolean;
   ignoredPatterns: string;
   concurrency: number;
+  maxFileSizeMB?: number;
   enableE2EE: boolean;
   e2eePassword?: string;
 }
 
 const CONFIG_HEADER_PREFIX = "BDSYNC:v1:";
+
+function toExactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer;
+  }
+  return bytes.slice().buffer;
+}
 
 export function uint8ArrayToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -41,7 +51,7 @@ export function base64ToUint8Array(base64: string): Uint8Array {
     }
     return bytes;
   } catch {
-    throw new Error("配对码格式无效（Base64解析失败），请检查是否完整复制！");
+    throw new Error(t("configShare.invalidBase64"));
   }
 }
 
@@ -53,7 +63,7 @@ export async function exportEncryptedConfig(
   pin: string
 ): Promise<string> {
   if (!pin || pin.trim().length === 0) {
-    throw new Error("配对保护密码不能为空，请设置一个临时配对密码！");
+    throw new Error(t("configShare.emptyPinExport"));
   }
 
   const exportPayload: SharedSyncConfig = {
@@ -63,20 +73,22 @@ export async function exportEncryptedConfig(
     refreshToken: settings.refreshToken,
     tokenExpiresAt: settings.tokenExpiresAt,
     remoteBasePath: settings.remoteBasePath,
+    conflictStrategy: settings.conflictStrategy,
     syncObsidianConfig: settings.syncObsidianConfig,
     syncPlugins: settings.syncPlugins,
     syncThemes: settings.syncThemes,
     ignoredPatterns: settings.ignoredPatterns,
     concurrency: settings.concurrency,
+    maxFileSizeMB: settings.maxFileSizeMB,
     enableE2EE: settings.enableE2EE,
     e2eePassword: settings.e2eePassword
   };
 
   const jsonStr = JSON.stringify(exportPayload);
   const enc = new TextEncoder();
-  const rawData = enc.encode(jsonStr).buffer;
+  const rawData = toExactArrayBuffer(enc.encode(jsonStr));
 
-  const encryptedBuf = await encryptData(rawData, pin.trim());
+  const encryptedBuf = await encryptData(rawData, pin.trim(), { ephemeralMasterSalt: true });
   const b64 = uint8ArrayToBase64(new Uint8Array(encryptedBuf));
   return `${CONFIG_HEADER_PREFIX}${b64}`;
 }
@@ -90,26 +102,27 @@ export async function importEncryptedConfig(
 ): Promise<SharedSyncConfig> {
   const trimmed = pairingCode.trim();
   if (!trimmed.startsWith(CONFIG_HEADER_PREFIX)) {
-    throw new Error("无效的配对码格式！配对码必须以 BDSYNC:v1: 开头。");
+    throw new Error(t("configShare.invalidPrefix"));
   }
 
   if (!pin || pin.trim().length === 0) {
-    throw new Error("请输入配对保护密码！");
+    throw new Error(t("configShare.emptyPinImport"));
   }
 
   const base64Part = trimmed.slice(CONFIG_HEADER_PREFIX.length);
   const encryptedBytes = base64ToUint8Array(base64Part);
+  const encryptedBuffer = toExactArrayBuffer(encryptedBytes);
 
   // Enforce cryptographic magic header check to prevent plaintext downgrade / PIN bypass attacks
-  if (!isEncrypted(encryptedBytes.buffer)) {
-    throw new Error("非法配对码：数据未经过加密保护，已被系统拒绝！");
+  if (!isEncrypted(encryptedBuffer)) {
+    throw new Error(t("configShare.unencryptedRejected"));
   }
 
   let decryptedBuf: ArrayBuffer;
   try {
-    decryptedBuf = await decryptData(encryptedBytes.buffer, pin.trim());
+    decryptedBuf = await decryptData(encryptedBuffer, pin.trim());
   } catch {
-    throw new Error("配对码解密失败！请确认配对保护密码是否与导出时一致。");
+    throw new Error(t("configShare.decryptFailed"));
   }
 
   const dec = new TextDecoder();
@@ -118,11 +131,11 @@ export async function importEncryptedConfig(
   try {
     parsed = JSON.parse(jsonStr);
   } catch {
-    throw new Error("解析配置数据失败，解密内容不是有效的 JSON 结构。");
+    throw new Error(t("configShare.invalidJson"));
   }
 
   if (!parsed || typeof parsed !== "object" || !("remoteBasePath" in parsed)) {
-    throw new Error("配置数据格式不完整或已损坏。");
+    throw new Error(t("configShare.incompletePayload"));
   }
 
   return parsed as SharedSyncConfig;

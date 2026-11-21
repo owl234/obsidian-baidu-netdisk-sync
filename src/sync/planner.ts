@@ -1,8 +1,12 @@
 import { ManifestItem } from "./manifest";
+import { ConflictStrategy } from "../settings/settings";
+import { t } from "../i18n";
 
 export type SyncActionType =
   | "UPLOAD"
   | "DOWNLOAD"
+  | "CONFLICT"
+  | "UPDATE_MANIFEST"
   | "DELETE_LOCAL"
   | "DELETE_REMOTE"
   | "CLEAN_MANIFEST"
@@ -12,6 +16,7 @@ export interface LocalFileInfo {
   path: string;
   mtime: number;
   size: number;
+  md5?: string;
 }
 
 export interface RemoteFileInfo {
@@ -28,9 +33,53 @@ export interface SyncPlanItem {
   remotePath: string;
   action: SyncActionType;
   reason: string;
+  winner?: "local" | "remote";
   local?: LocalFileInfo;
   remote?: RemoteFileInfo;
   manifest?: ManifestItem;
+}
+
+export interface SyncPlanOptions {
+  conflictStrategy?: ConflictStrategy;
+  enableE2EE?: boolean;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+/**
+ * Generates a deterministic conflict backup filename preserving extension and directory.
+ * Example: "Notes/Daily.md" -> "Notes/Daily.conflict-20261121-183045.md"
+ */
+export function buildConflictPath(originalPath: string, date: Date = new Date()): string {
+  const stamp =
+    `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}-` +
+    `${pad2(date.getHours())}${pad2(date.getMinutes())}${pad2(date.getSeconds())}`;
+
+  const lastSlash = originalPath.lastIndexOf("/");
+  const dir = lastSlash >= 0 ? originalPath.slice(0, lastSlash + 1) : "";
+  const fileName = lastSlash >= 0 ? originalPath.slice(lastSlash + 1) : originalPath;
+
+  const dotIdx = fileName.lastIndexOf(".");
+  // Handle dotfiles like ".gitignore" without splitting leading dot
+  if (dotIdx > 0) {
+    const stem = fileName.slice(0, dotIdx);
+    const ext = fileName.slice(dotIdx);
+    return `${dir}${stem}.conflict-${stamp}${ext}`;
+  }
+  return `${dir}${fileName}.conflict-${stamp}`;
+}
+
+function isPlaintextIdentical(
+  local: LocalFileInfo,
+  remote: RemoteFileInfo,
+  enableE2EE: boolean
+): boolean {
+  if (enableE2EE) return false;
+  if (local.size !== remote.size) return false;
+  if (!local.md5 || !remote.md5) return false;
+  return local.md5.toLowerCase() === remote.md5.toLowerCase();
 }
 
 export class SyncPlanner {
@@ -38,8 +87,12 @@ export class SyncPlanner {
     localFiles: Map<string, LocalFileInfo>,
     remoteFiles: Map<string, RemoteFileInfo>,
     manifestFiles: Record<string, ManifestItem>,
-    remoteBasePath: string
+    remoteBasePath: string,
+    options: SyncPlanOptions = {}
   ): SyncPlanItem[] {
+    const conflictStrategy: ConflictStrategy = options.conflictStrategy ?? "copy";
+    const enableE2EE = options.enableE2EE ?? false;
+
     const plans: SyncPlanItem[] = [];
     const allPaths = new Set<string>([
       ...localFiles.keys(),
@@ -47,9 +100,7 @@ export class SyncPlanner {
       ...Object.keys(manifestFiles)
     ]);
 
-    const normalizeRemoteBase = remoteBasePath.endsWith("/")
-      ? remoteBasePath.slice(0, -1)
-      : remoteBasePath;
+    const normalizeRemoteBase = remoteBasePath.replace(/\/+$/, "");
 
     for (const path of allPaths) {
       const local = localFiles.get(path);
@@ -60,13 +111,36 @@ export class SyncPlanner {
       // Case 1: Both sides exist
       if (local && remote) {
         if (!manifest) {
-          // No manifest, conflict resolution via LWW
-          if (local.mtime >= remote.mtime) {
+          // If plaintext files have identical size & MD5, just record manifest baseline
+          if (isPlaintextIdentical(local, remote, enableE2EE)) {
+            plans.push({
+              path,
+              remotePath,
+              action: "UPDATE_MANIFEST",
+              reason: t("plan.identicalBaseline"),
+              local,
+              remote
+            });
+            continue;
+          }
+
+          const winner: "local" | "remote" = local.mtime >= remote.mtime ? "local" : "remote";
+          if (conflictStrategy === "copy") {
+            plans.push({
+              path,
+              remotePath,
+              action: "CONFLICT",
+              winner,
+              reason: t("plan.noManifestConflict"),
+              local,
+              remote
+            });
+          } else if (winner === "local") {
             plans.push({
               path,
               remotePath,
               action: "UPLOAD",
-              reason: "双端均存在且无同步历史，本地时间戳较新 (LWW 胜出)",
+              reason: t("plan.noManifestLocalNewer"),
               local,
               remote
             });
@@ -75,7 +149,7 @@ export class SyncPlanner {
               path,
               remotePath,
               action: "DOWNLOAD",
-              reason: "双端均存在且无同步历史，远端时间戳较新 (LWW 胜出)",
+              reason: t("plan.noManifestRemoteNewer"),
               local,
               remote
             });
@@ -93,14 +167,13 @@ export class SyncPlanner {
           remote.size !== expectedRemoteSize;
 
         if (!localChanged && !remoteChanged) {
-          // Both unchanged
           continue;
         } else if (localChanged && !remoteChanged) {
           plans.push({
             path,
             remotePath,
             action: "UPLOAD",
-            reason: "本地文件有更新，推送到网盘",
+            reason: t("plan.localModified"),
             local,
             remote,
             manifest
@@ -110,19 +183,44 @@ export class SyncPlanner {
             path,
             remotePath,
             action: "DOWNLOAD",
-            reason: "网盘端文件有更新，拉取到本地",
+            reason: t("plan.remoteModified"),
             local,
             remote,
             manifest
           });
         } else {
-          // Both changed: Conflict resolved by LWW
-          if (local.mtime >= remote.mtime) {
+          // Both changed: check if plaintext edits converged to identical content
+          if (isPlaintextIdentical(local, remote, enableE2EE)) {
+            plans.push({
+              path,
+              remotePath,
+              action: "UPDATE_MANIFEST",
+              reason: t("plan.identicalBaseline"),
+              local,
+              remote,
+              manifest
+            });
+            continue;
+          }
+
+          const winner: "local" | "remote" = local.mtime >= remote.mtime ? "local" : "remote";
+          if (conflictStrategy === "copy") {
+            plans.push({
+              path,
+              remotePath,
+              action: "CONFLICT",
+              winner,
+              reason: t("plan.bothModifiedConflict"),
+              local,
+              remote,
+              manifest
+            });
+          } else if (winner === "local") {
             plans.push({
               path,
               remotePath,
               action: "UPLOAD",
-              reason: "双端并发修改产生冲突，本地时间戳较新 (LWW 覆盖远端)",
+              reason: t("plan.bothModifiedLocalNewer"),
               local,
               remote,
               manifest
@@ -132,7 +230,7 @@ export class SyncPlanner {
               path,
               remotePath,
               action: "DOWNLOAD",
-              reason: "双端并发修改产生冲突，远端时间戳较新 (LWW 覆盖本地)",
+              reason: t("plan.bothModifiedRemoteNewer"),
               local,
               remote,
               manifest
@@ -149,7 +247,7 @@ export class SyncPlanner {
             path,
             remotePath,
             action: "UPLOAD",
-            reason: "本地新增文件，推送到网盘",
+            reason: t("plan.localAdded"),
             local
           });
         } else {
@@ -157,22 +255,20 @@ export class SyncPlanner {
           const localChanged =
             Math.abs(local.mtime - manifest.mtime) > 1000 || local.size !== manifest.size;
           if (localChanged) {
-            // Local was modified after remote deletion, keep local
             plans.push({
               path,
               remotePath,
               action: "UPLOAD",
-              reason: "远端已删除但本地有新修改，重新推送到网盘",
+              reason: t("plan.remoteDeletedLocalModified"),
               local,
               manifest
             });
           } else {
-            // Remote was deleted and local unchanged -> Delete local
             plans.push({
               path,
               remotePath,
               action: "DELETE_LOCAL",
-              reason: "网盘端已删除，同步移入本地回收站",
+              reason: t("plan.remoteDeleted"),
               local,
               manifest
             });
@@ -188,7 +284,7 @@ export class SyncPlanner {
             path,
             remotePath,
             action: "DOWNLOAD",
-            reason: "网盘端新增文件，拉取到本地",
+            reason: t("plan.remoteAdded"),
             remote
           });
         } else {
@@ -199,22 +295,20 @@ export class SyncPlanner {
             Math.abs(remote.mtime - manifest.remoteMtime) > 1000 ||
             remote.size !== expectedRemoteSize;
           if (remoteChanged) {
-            // Remote was modified after local deletion, keep remote
             plans.push({
               path,
               remotePath,
               action: "DOWNLOAD",
-              reason: "本地已删除但网盘端有新修改，重新拉取到本地",
+              reason: t("plan.localDeletedRemoteModified"),
               remote,
               manifest
             });
           } else {
-            // Local was deleted and remote unchanged -> Delete remote
             plans.push({
               path,
               remotePath,
               action: "DELETE_REMOTE",
-              reason: "本地已删除，同步移入网盘回收站",
+              reason: t("plan.localDeleted"),
               remote,
               manifest
             });
@@ -229,7 +323,7 @@ export class SyncPlanner {
           path,
           remotePath,
           action: "CLEAN_MANIFEST",
-          reason: "两端均已不存在，清理元数据基线",
+          reason: t("plan.cleanManifest"),
           manifest
         });
       }

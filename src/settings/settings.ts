@@ -1,10 +1,15 @@
+export type ConflictStrategy = "copy" | "lww";
+
 export interface BaiduSyncSettings {
   appKey: string;
   appSecret: string;
   accessToken: string;
   refreshToken: string;
   tokenExpiresAt: number; // Unix timestamp in ms
-  remoteBasePath: string;  // e.g. "/apps/obsidian_vault"
+  remoteBasePath: string; // e.g. "/apps/obsidian_vault"
+
+  // Conflict resolution
+  conflictStrategy: ConflictStrategy;
 
   // Sync triggers
   syncOnStartup: boolean;
@@ -12,14 +17,15 @@ export interface BaiduSyncSettings {
   syncOnSave: boolean;
   syncDebounceSeconds: number;
 
-  // Sync Scope
+  // Sync scope
   syncObsidianConfig: boolean;
   syncPlugins: boolean;
   syncThemes: boolean;
   ignoredPatterns: string; // Newline separated patterns
 
-  // Concurrency and Network
+  // Concurrency and network safety
   concurrency: number; // 1 to 5, default 3
+  maxFileSizeMB: number; // 0 disables size limit, default 100
 
   // E2EE
   enableE2EE: boolean;
@@ -36,6 +42,8 @@ export const DEFAULT_SETTINGS: BaiduSyncSettings = {
   refreshToken: "",
   tokenExpiresAt: 0,
   remoteBasePath: "/apps/obsidian_vault",
+
+  conflictStrategy: "copy",
 
   syncOnStartup: true,
   syncIntervalMinutes: 10,
@@ -55,6 +63,7 @@ export const DEFAULT_SETTINGS: BaiduSyncSettings = {
   ].join("\n"),
 
   concurrency: 3,
+  maxFileSizeMB: 100,
 
   enableE2EE: false,
   e2eePassword: "",

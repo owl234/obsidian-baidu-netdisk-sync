@@ -1,17 +1,26 @@
-import { requestUrl } from "obsidian";
 import { BaiduSyncSettings } from "../settings/settings";
-import { BaiduTokenResponse, BaiduUserInfoResponse } from "./types";
+import {
+  BaiduTokenResponse,
+  BaiduUserInfoResponse,
+  HttpRequestFn,
+  parseJsonPreserveIds,
+  sanitizeErrorMessage
+} from "./types";
+import { t } from "../i18n";
 
 export class BaiduOAuthManager {
+  private refreshInFlight: Promise<string> | null = null;
+
   constructor(
     private getSettings: () => BaiduSyncSettings,
-    private saveSettings: (settings: BaiduSyncSettings) => Promise<void>
+    private saveSettings: (settings: BaiduSyncSettings) => Promise<void>,
+    private httpRequest: HttpRequestFn
   ) {}
 
   getOAuthUrl(): string {
     const settings = this.getSettings();
     if (!settings.appKey) {
-      throw new Error("请先填写 AppKey");
+      throw new Error(t("oauth.missingAppKey"));
     }
     const clientId = encodeURIComponent(settings.appKey.trim());
     return `https://openapi.baidu.com/oauth/2.0/authorize?response_type=code&client_id=${clientId}&redirect_uri=oob&scope=basic,netdisk`;
@@ -20,7 +29,7 @@ export class BaiduOAuthManager {
   async exchangeCodeForToken(code: string): Promise<BaiduTokenResponse> {
     const settings = this.getSettings();
     if (!settings.appKey || !settings.appSecret) {
-      throw new Error("请先填写 AppKey 与 AppSecret");
+      throw new Error(t("oauth.missingCredentials"));
     }
 
     const trimmedCode = code.trim();
@@ -33,22 +42,33 @@ export class BaiduOAuthManager {
       redirect_uri: "oob"
     });
 
-    const resp = await requestUrl({
+    const resp = await this.httpRequest({
       url,
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded"
       },
-      body: body.toString()
+      body: body.toString(),
+      throw: false
     });
 
     if (resp.status !== 200) {
-      throw new Error(`获取 Token 失败 (HTTP ${resp.status}): ${resp.text}`);
+      throw new Error(
+        t("oauth.tokenExchangeHttpError", {
+          status: resp.status,
+          detail: sanitizeErrorMessage(resp.text || "")
+        })
+      );
     }
 
-    const tokenData = resp.json as unknown as BaiduTokenResponse;
+    const tokenData = parseJsonPreserveIds<BaiduTokenResponse>(resp.text);
     if (tokenData.error) {
-      throw new Error(`授权错误 [${tokenData.error}]: ${tokenData.error_description || "未知错误"}`);
+      throw new Error(
+        t("oauth.tokenExchangeApiError", {
+          error: tokenData.error,
+          detail: tokenData.error_description || t("oauth.unknownError")
+        })
+      );
     }
 
     const now = Date.now();
@@ -64,7 +84,7 @@ export class BaiduOAuthManager {
   async refreshTokenIfNeeded(force = false): Promise<string> {
     const settings = this.getSettings();
     if (!settings.refreshToken) {
-      throw new Error("尚未授权百度网盘账号，请先在插件设置中完成授权");
+      throw new Error(t("oauth.missingRefreshToken"));
     }
 
     // Refresh 1 day before expiration
@@ -75,60 +95,93 @@ export class BaiduOAuthManager {
       return settings.accessToken;
     }
 
+    // Deduplicate concurrent refresh requests across parallel workers
+    if (this.refreshInFlight) {
+      return this.refreshInFlight;
+    }
+
+    const refreshTask = this.performTokenRefresh();
+    this.refreshInFlight = refreshTask;
+
+    try {
+      return await refreshTask;
+    } finally {
+      if (this.refreshInFlight === refreshTask) {
+        this.refreshInFlight = null;
+      }
+    }
+  }
+
+  private async performTokenRefresh(): Promise<string> {
+    const settings = this.getSettings();
     try {
       const url = "https://openapi.baidu.com/oauth/2.0/token";
       const body = new URLSearchParams({
         grant_type: "refresh_token",
-        refresh_token: settings.refreshToken,
-        client_id: settings.appKey,
-        client_secret: settings.appSecret
+        refresh_token: settings.refreshToken.trim(),
+        client_id: settings.appKey.trim(),
+        client_secret: settings.appSecret.trim()
       });
 
-      const resp = await requestUrl({
+      const resp = await this.httpRequest({
         url,
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded"
         },
-        body: body.toString()
+        body: body.toString(),
+        throw: false
       });
 
       if (resp.status !== 200) {
-        throw new Error(`刷新 Token 失败 (HTTP ${resp.status}): ${resp.text}`);
+        throw new Error(
+          t("oauth.tokenRefreshHttpError", {
+            status: resp.status,
+            detail: sanitizeErrorMessage(resp.text || "")
+          })
+        );
       }
 
-      const tokenData = resp.json as unknown as BaiduTokenResponse;
+      const tokenData = parseJsonPreserveIds<BaiduTokenResponse>(resp.text);
       if (tokenData.error) {
-        throw new Error(`刷新 Token 异常 [${tokenData.error}]: ${tokenData.error_description || "未知错误"}`);
+        throw new Error(
+          t("oauth.tokenRefreshApiError", {
+            error: tokenData.error,
+            detail: tokenData.error_description || t("oauth.unknownError")
+          })
+        );
       }
 
-      settings.accessToken = tokenData.access_token;
+      const latestSettings = this.getSettings();
+      latestSettings.accessToken = tokenData.access_token;
       if (tokenData.refresh_token) {
-        settings.refreshToken = tokenData.refresh_token;
+        latestSettings.refreshToken = tokenData.refresh_token;
       }
-      settings.tokenExpiresAt = Date.now() + (tokenData.expires_in || 2592000) * 1000;
-      await this.saveSettings(settings);
+      latestSettings.tokenExpiresAt = Date.now() + (tokenData.expires_in || 2592000) * 1000;
+      await this.saveSettings(latestSettings);
 
-      return settings.accessToken;
+      return latestSettings.accessToken;
     } catch (err: unknown) {
-      console.error("[BaiduSync] 刷新 Token 失败:", err);
-      throw (err instanceof Error ? err : new Error(String(err)));
+      const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+      console.error("[BaiduSync] Token refresh failed:", msg);
+      throw new Error(msg);
     }
   }
 
   async getUserInfo(): Promise<BaiduUserInfoResponse> {
     const token = await this.refreshTokenIfNeeded();
-    const url = `https://pan.baidu.com/rest/2.0/xpan/nas?method=uinfo&access_token=${token}`;
+    const url = `https://pan.baidu.com/rest/2.0/xpan/nas?method=uinfo&access_token=${encodeURIComponent(token)}`;
 
-    const resp = await requestUrl({
+    const resp = await this.httpRequest({
       url,
-      method: "GET"
+      method: "GET",
+      throw: false
     });
 
     if (resp.status !== 200) {
-      throw new Error(`获取用户信息失败: HTTP ${resp.status}`);
+      throw new Error(t("oauth.userInfoHttpError", { status: resp.status }));
     }
 
-    return resp.json as BaiduUserInfoResponse;
+    return parseJsonPreserveIds<BaiduUserInfoResponse>(resp.text);
   }
 }
