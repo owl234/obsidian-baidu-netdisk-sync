@@ -17,6 +17,7 @@ import {
   parseJsonPreserveIds,
   sanitizeErrorMessage
 } from "./types";
+import { HTTP_REQUEST_TIMEOUT_MS, withTimeout } from "../sync/timeout";
 import { t } from "../i18n";
 
 const FILEMETAS_BATCH_SIZE = 100;
@@ -32,6 +33,7 @@ interface RetryOptions {
 export interface BaiduClientOptions {
   delayFn?: DelayFn;
   onWarn?: (message: string) => void;
+  requestTimeoutMs?: number;
 }
 
 class RetryableRequestError extends Error {
@@ -63,6 +65,7 @@ function decodeSmallBufferToUtf8(buffer: ArrayBuffer): string {
 export class BaiduClient {
   private delayFn: DelayFn;
   private onWarn?: (message: string) => void;
+  private requestTimeoutMs: number;
 
   constructor(
     private oauth: BaiduOAuthManager,
@@ -71,6 +74,7 @@ export class BaiduClient {
   ) {
     this.delayFn = options.delayFn ?? defaultDelay;
     this.onWarn = options.onWarn;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? HTTP_REQUEST_TIMEOUT_MS;
   }
 
   private async requestWithRetry(
@@ -85,10 +89,15 @@ export class BaiduClient {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         const param = buildParam(token);
-        const resp = await this.httpRequest({
-          ...param,
-          throw: false
-        });
+        const resp = await withTimeout(
+          this.httpRequest({
+            ...param,
+            throw: false
+          }),
+          this.requestTimeoutMs,
+          `http.${param.method || "GET"}`,
+          "http"
+        );
 
         // HTTP 401 -> force token refresh and retry with new token
         if (resp.status === 401) {

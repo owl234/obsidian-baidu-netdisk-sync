@@ -21,7 +21,8 @@ export interface BaiduSyncSettings {
   syncObsidianConfig: boolean;
   syncPlugins: boolean;
   syncThemes: boolean;
-  ignoredPatterns: string; // Newline separated patterns
+  ignoredPatterns: string; // Newline separated global patterns (included in device pairing)
+  localIgnoredPatterns: string; // Newline separated device-only patterns (never exported/overwritten)
 
   // Concurrency and network safety
   concurrency: number; // 1 to 5, default 3
@@ -61,6 +62,7 @@ export const DEFAULT_SETTINGS: BaiduSyncSettings = {
     "**/cache/**",
     "**/indexeddb/**"
   ].join("\n"),
+  localIgnoredPatterns: "",
 
   concurrency: 3,
   maxFileSizeMB: 100,

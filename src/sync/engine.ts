@@ -5,7 +5,15 @@ import { BaiduDownloader } from "../baidu/downloader";
 import { BaiduFileMeta, sanitizeErrorMessage } from "../baidu/types";
 import { ManifestManager } from "./manifest";
 import { SyncFilter } from "./filter";
-import { AsyncQueue } from "./queue";
+import { AsyncQueue, QueueCancelledError } from "./queue";
+import {
+  BRIDGE_PROBE_TIMEOUT_MS,
+  BridgeDeadlockError,
+  FS_BINARY_TIMEOUT_MS,
+  FS_META_TIMEOUT_MS,
+  OperationTimeoutError,
+  withTimeout
+} from "./timeout";
 import {
   SyncPlanner,
   SyncPlanItem,
@@ -44,6 +52,11 @@ export interface VaultSyncBridge {
   configDir: string;
   exists(path: string): Promise<boolean>;
   stat(path: string): Promise<VaultFileStat | null>;
+  /**
+   * Optional zero-IPC fast stat using Obsidian's in-memory TFile index.
+   * Falls back to adapter.stat() when omitted or for unindexed files (e.g. configDir).
+   */
+  statFast?(path: string): Promise<VaultFileStat | null>;
   list(dir: string): Promise<{ files: string[]; folders: string[] }>;
   mkdir(path: string): Promise<void>;
   readBinary(path: string): Promise<ArrayBuffer>;
@@ -51,8 +64,37 @@ export interface VaultSyncBridge {
   trashFile(path: string): Promise<void>;
 }
 
+export interface SyncEngineOptions {
+  fsMetaTimeoutMs?: number;
+  fsBinaryTimeoutMs?: number;
+  bridgeProbeTimeoutMs?: number;
+  checkpointItems?: number;
+  checkpointIntervalMs?: number;
+}
+
+interface SyncRunContext {
+  readonly runId: number;
+  readonly queue: AsyncQueue;
+  bridgeDead: boolean;
+  bridgeError: BridgeDeadlockError | null;
+  probePromise: Promise<boolean> | null;
+  readonly abortPromise: Promise<never>;
+  abortRun: (err: BridgeDeadlockError) => void;
+  isCurrent: () => boolean;
+  exists: (path: string) => Promise<boolean>;
+  stat: (path: string) => Promise<VaultFileStat | null>;
+  statFast: (path: string) => Promise<VaultFileStat | null>;
+  list: (dir: string) => Promise<{ files: string[]; folders: string[] }>;
+  mkdir: (path: string) => Promise<void>;
+  readBinary: (path: string) => Promise<ArrayBuffer>;
+  writeBinary: (path: string, data: ArrayBuffer) => Promise<void>;
+  trashFile: (path: string) => Promise<void>;
+}
+
 const ECHO_SUPPRESSION_MS = 3000;
 const DELETE_BATCH_SIZE = 100;
+const DEFAULT_CHECKPOINT_ITEMS = 25;
+const DEFAULT_CHECKPOINT_INTERVAL_MS = 20_000;
 
 function buffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   if (a.byteLength !== b.byteLength) return false;
@@ -74,7 +116,6 @@ export class SyncEngine {
   private state: SyncState = "idle";
   private lastStatusMessage: string = "";
   private filter: SyncFilter;
-  private queue: AsyncQueue;
   private uploader: BaiduUploader;
   private downloader: BaiduDownloader;
   private logs: SyncLogEntry[] = [];
@@ -82,19 +123,35 @@ export class SyncEngine {
   private onLogListeners: Array<(entry: SyncLogEntry) => void> = [];
   private recentSyncWrites = new Map<string, number>();
 
+  // Strict single-flight run tracking & generation counter to prevent re-entrancy
+  private runSeq = 0;
+  private activeRunId: number | null = null;
+  private migrationActive = false;
+
+  private readonly fsMetaTimeoutMs: number;
+  private readonly fsBinaryTimeoutMs: number;
+  private readonly bridgeProbeTimeoutMs: number;
+  private readonly checkpointItems: number;
+  private readonly checkpointIntervalMs: number;
+
   constructor(
     private vault: VaultSyncBridge,
     private getSettings: () => BaiduSyncSettings,
     private saveSettings: (settings: BaiduSyncSettings) => Promise<void>,
     private client: BaiduClient,
     private manifest: ManifestManager,
-    pluginDir: string = ""
+    pluginDir: string = "",
+    options: SyncEngineOptions = {}
   ) {
     const settings = this.getSettings();
     this.filter = new SyncFilter(settings, this.vault.configDir, pluginDir);
-    this.queue = new AsyncQueue(settings.concurrency || 3);
     this.uploader = new BaiduUploader(this.client);
     this.downloader = new BaiduDownloader(this.client);
+    this.fsMetaTimeoutMs = options.fsMetaTimeoutMs ?? FS_META_TIMEOUT_MS;
+    this.fsBinaryTimeoutMs = options.fsBinaryTimeoutMs ?? FS_BINARY_TIMEOUT_MS;
+    this.bridgeProbeTimeoutMs = options.bridgeProbeTimeoutMs ?? BRIDGE_PROBE_TIMEOUT_MS;
+    this.checkpointItems = options.checkpointItems ?? DEFAULT_CHECKPOINT_ITEMS;
+    this.checkpointIntervalMs = options.checkpointIntervalMs ?? DEFAULT_CHECKPOINT_INTERVAL_MS;
   }
 
   onStateChange(listener: (state: SyncState, message?: string) => void): () => void {
@@ -128,7 +185,11 @@ export class SyncEngine {
   }
 
   isSyncing(): boolean {
-    return this.state !== "idle" && this.state !== "error";
+    return (
+      this.activeRunId !== null ||
+      this.migrationActive ||
+      (this.state !== "idle" && this.state !== "error")
+    );
   }
 
   getLogs(): SyncLogEntry[] {
@@ -181,6 +242,135 @@ export class SyncEngine {
     }
   }
 
+  private async probeBridgeHealth(ctx: SyncRunContext): Promise<boolean> {
+    if (ctx.bridgeDead) return false;
+    if (ctx.probePromise) return ctx.probePromise;
+
+    const probeTarget = this.vault.configDir || ".";
+    const runProbe = async (): Promise<boolean> => {
+      try {
+        await withTimeout(
+          this.vault.exists(probeTarget),
+          this.bridgeProbeTimeoutMs,
+          `bridge.probe(${probeTarget})`,
+          "vault"
+        );
+        return true;
+      } catch {
+        ctx.bridgeDead = true;
+        ctx.bridgeError = new BridgeDeadlockError(t("engine.bridgeDeadlock"));
+        return false;
+      }
+    };
+
+    const probe = runProbe().finally(() => {
+      if (ctx.probePromise === probe) {
+        ctx.probePromise = null;
+      }
+    });
+
+    ctx.probePromise = probe;
+    return probe;
+  }
+
+  private createRunContext(runId: number, concurrency: number): SyncRunContext {
+    const queue = new AsyncQueue(concurrency);
+    let rejectAbort!: (err: BridgeDeadlockError) => void;
+    let aborted = false;
+
+    const abortPromise = new Promise<never>((_, reject) => {
+      rejectAbort = reject;
+    });
+    // Attach default handler to avoid unhandled rejection if abort fires before Promise.race
+    abortPromise.catch(() => {});
+
+    const ctx: SyncRunContext = {
+      runId,
+      queue,
+      bridgeDead: false,
+      bridgeError: null,
+      probePromise: null,
+      abortPromise,
+      abortRun: (err: BridgeDeadlockError) => {
+        if (aborted) return;
+        aborted = true;
+        ctx.bridgeDead = true;
+        ctx.bridgeError = err;
+        queue.clear(err);
+        rejectAbort(err);
+      },
+      isCurrent: () => this.activeRunId === runId && this.runSeq === runId && !ctx.bridgeDead,
+      exists: (path: string) =>
+        this.runVaultOp(ctx, `exists(${path})`, this.fsMetaTimeoutMs, () => this.vault.exists(path)),
+      stat: (path: string) =>
+        this.runVaultOp(ctx, `stat(${path})`, this.fsMetaTimeoutMs, () => this.vault.stat(path)),
+      statFast: (path: string) =>
+        this.runVaultOp(ctx, `statFast(${path})`, this.fsMetaTimeoutMs, () =>
+          this.vault.statFast ? this.vault.statFast(path) : this.vault.stat(path)
+        ),
+      list: (dir: string) =>
+        this.runVaultOp(ctx, `list(${dir || "/"})`, this.fsMetaTimeoutMs, () => this.vault.list(dir)),
+      mkdir: (path: string) =>
+        this.runVaultOp(ctx, `mkdir(${path})`, this.fsMetaTimeoutMs, () => this.vault.mkdir(path)),
+      readBinary: (path: string) =>
+        this.runVaultOp(ctx, `readBinary(${path})`, this.fsBinaryTimeoutMs, () =>
+          this.vault.readBinary(path)
+        ),
+      writeBinary: (path: string, data: ArrayBuffer) =>
+        this.runVaultOp(ctx, `writeBinary(${path})`, this.fsBinaryTimeoutMs, () =>
+          this.vault.writeBinary(path, data)
+        ),
+      trashFile: (path: string) =>
+        this.runVaultOp(ctx, `trashFile(${path})`, this.fsMetaTimeoutMs, () =>
+          this.vault.trashFile(path)
+        )
+    };
+
+    return ctx;
+  }
+
+  private async runVaultOp<T>(
+    ctx: SyncRunContext,
+    opName: string,
+    timeoutMs: number,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    if (ctx.bridgeDead) {
+      throw ctx.bridgeError ?? new BridgeDeadlockError(t("engine.bridgeDeadlock"));
+    }
+    if (!ctx.isCurrent()) {
+      throw new QueueCancelledError("Stale sync run cancelled");
+    }
+
+    try {
+      return await withTimeout(fn(), timeoutMs, opName, "vault");
+    } catch (err: unknown) {
+      if (err instanceof OperationTimeoutError && err.kind === "vault") {
+        if (ctx.isCurrent()) {
+          this.addLog(
+            "warn",
+            t("engine.vaultTimeoutProbing", {
+              op: opName,
+              seconds: Math.max(1, Math.round(timeoutMs / 1000))
+            })
+          );
+        }
+
+        const alive = await this.probeBridgeHealth(ctx);
+        if (!alive) {
+          const deadlockErr = ctx.bridgeError ?? new BridgeDeadlockError(t("engine.bridgeDeadlock"));
+          ctx.abortRun(deadlockErr);
+          throw deadlockErr;
+        }
+
+        if (ctx.isCurrent()) {
+          this.addLog("warn", t("engine.bridgeProbeAlive", { op: opName }));
+        }
+      }
+      throw err;
+    }
+  }
+
   private getMaxBytes(settings: BaiduSyncSettings): number {
     return settings.maxFileSizeMB > 0 ? settings.maxFileSizeMB * 1024 * 1024 : Infinity;
   }
@@ -202,7 +392,11 @@ export class SyncEngine {
     return false;
   }
 
-  private async ensureParentDir(filePath: string, ensuredDirs: Set<string>): Promise<void> {
+  private async ensureParentDir(
+    filePath: string,
+    ensuredDirs: Set<string>,
+    ctx: SyncRunContext
+  ): Promise<void> {
     const lastSlash = filePath.lastIndexOf("/");
     if (lastSlash <= 0) return;
     const fullDir = filePath.substring(0, lastSlash);
@@ -213,17 +407,20 @@ export class SyncEngine {
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
       if (!ensuredDirs.has(current)) {
-        if (!(await this.vault.exists(current))) {
-          await this.vault.mkdir(current);
+        if (!(await ctx.exists(current))) {
+          await ctx.mkdir(current);
         }
         ensuredDirs.add(current);
       }
     }
   }
 
-  private async resolveUniqueConflictPath(originalPath: string): Promise<string> {
+  private async resolveUniqueConflictPath(
+    originalPath: string,
+    ctx: SyncRunContext
+  ): Promise<string> {
     const baseCandidate = buildConflictPath(originalPath);
-    if (!(await this.vault.exists(baseCandidate))) {
+    if (!(await ctx.exists(baseCandidate))) {
       return baseCandidate;
     }
 
@@ -234,7 +431,7 @@ export class SyncEngine {
       const candidate = hasExt
         ? `${baseCandidate.slice(0, dotIdx)}-${i}${baseCandidate.slice(dotIdx)}`
         : `${baseCandidate}-${i}`;
-      if (!(await this.vault.exists(candidate))) {
+      if (!(await ctx.exists(candidate))) {
         return candidate;
       }
     }
@@ -248,13 +445,15 @@ export class SyncEngine {
   private async populateCandidateLocalMd5(
     localFiles: Map<string, LocalFileInfo>,
     remoteFiles: Map<string, RemoteFileInfo>,
-    settings: BaiduSyncSettings
+    settings: BaiduSyncSettings,
+    ctx: SyncRunContext
   ): Promise<void> {
     if (settings.enableE2EE) return;
     const manifestAll = this.manifest.getAll();
     const maxBytes = this.getMaxBytes(settings);
 
     for (const [path, local] of localFiles) {
+      if (!ctx.isCurrent()) return;
       const remote = remoteFiles.get(path);
       if (!remote || !remote.md5) continue;
       if (local.size !== remote.size || local.size > maxBytes) continue;
@@ -272,15 +471,26 @@ export class SyncEngine {
       }
 
       try {
-        const buf = await this.vault.readBinary(path);
+        const buf = await ctx.readBinary(path);
         local.md5 = md5(buf);
-      } catch {
-        // Ignore read error here; transfer phase handles it
+      } catch (err: unknown) {
+        if (err instanceof BridgeDeadlockError) {
+          throw err;
+        }
+        // Ignore single-file read error here; transfer phase handles it
       }
     }
   }
 
-  async startSync(_silent = false): Promise<{ success: boolean; stats: SyncStats }> {
+  async startSync(
+    _silent = false
+  ): Promise<{ success: boolean; stats: SyncStats; bridgeDead?: boolean }> {
+    return this.executeSyncRun(false);
+  }
+
+  private async executeSyncRun(
+    allowDuringMigration: boolean
+  ): Promise<{ success: boolean; stats: SyncStats; bridgeDead?: boolean }> {
     const stats: SyncStats = {
       uploaded: 0,
       downloaded: 0,
@@ -290,7 +500,11 @@ export class SyncEngine {
       errors: 0
     };
 
-    if (this.state !== "idle" && this.state !== "error") {
+    if (
+      this.activeRunId !== null ||
+      (!allowDuringMigration && this.migrationActive) ||
+      (this.state !== "idle" && this.state !== "error")
+    ) {
       this.addLog("warn", t("engine.alreadyRunning"));
       return { success: false, stats };
     }
@@ -302,19 +516,33 @@ export class SyncEngine {
       return { success: false, stats };
     }
 
+    const runId = ++this.runSeq;
+    this.activeRunId = runId;
     this.filter.updateSettings(settings);
-    this.queue.setConcurrency(settings.concurrency || 3);
+    const ctx = this.createRunContext(runId, settings.concurrency || 3);
 
     const startTime = Date.now();
     const ensuredDirs = new Set<string>();
 
     try {
       this.setState("preparing", t("engine.loadingManifest"));
-      await this.manifest.load();
+      try {
+        await this.manifest.load();
+      } catch (err: unknown) {
+        if (err instanceof OperationTimeoutError && err.kind === "vault") {
+          const alive = await this.probeBridgeHealth(ctx);
+          if (!alive) {
+            const deadlockErr = ctx.bridgeError ?? new BridgeDeadlockError(t("engine.bridgeDeadlock"));
+            ctx.abortRun(deadlockErr);
+            throw deadlockErr;
+          }
+        }
+        throw err;
+      }
 
       // Step 1: Scan local files
       this.setState("diffing", t("engine.scanningLocal"));
-      const localFiles = await this.scanLocalFiles();
+      const localFiles = await this.scanLocalFiles(ctx);
 
       // Step 2: Scan remote files
       this.setState("diffing", t("engine.scanningRemote"));
@@ -322,7 +550,7 @@ export class SyncEngine {
 
       // Step 3: Compute local MD5 for plaintext dedup candidates & build diff plan
       this.setState("diffing", t("engine.computingPlan"));
-      await this.populateCandidateLocalMd5(localFiles, remoteFiles, settings);
+      await this.populateCandidateLocalMd5(localFiles, remoteFiles, settings, ctx);
 
       const plans = SyncPlanner.plan(
         localFiles,
@@ -367,10 +595,12 @@ export class SyncEngine {
 
       // Execute batched remote deletions first (up to 100 paths per API call)
       for (let i = 0; i < remoteDeleteItems.length; i += DELETE_BATCH_SIZE) {
+        if (!ctx.isCurrent()) break;
         const batch = remoteDeleteItems.slice(i, i + DELETE_BATCH_SIZE);
         const remotePaths = batch.map((b) => b.remotePath);
         try {
           await this.client.deleteFiles(remotePaths);
+          if (!ctx.isCurrent()) break;
           for (const b of batch) {
             this.manifest.delete(b.path);
           }
@@ -389,36 +619,75 @@ export class SyncEngine {
             msg
           );
         } finally {
-          processed += batch.length;
-          this.setState("syncing", t("engine.syncProgress", { done: processed, total: totalOps }));
+          if (ctx.isCurrent()) {
+            processed += batch.length;
+            this.setState("syncing", t("engine.syncProgress", { done: processed, total: totalOps }));
+            const saved = await this.manifest.maybeCheckpoint(
+              this.checkpointItems,
+              this.checkpointIntervalMs
+            );
+            if (saved && ctx.isCurrent()) {
+              this.addLog("info", t("engine.manifestCheckpoint", { done: processed, total: totalOps }));
+            }
+          }
         }
       }
 
-      // Execute remaining items with true concurrency via AsyncQueue
+      // Execute remaining items with true concurrency via per-run AsyncQueue
       const tasks = otherItems.map((item) =>
-        this.queue.add(async () => {
+        ctx.queue.add(async () => {
+          if (!ctx.isCurrent()) return;
           try {
-            const outcome = await this.executePlanItem(item, settings, prefetchedMetas, ensuredDirs);
+            const outcome = await this.executePlanItem(
+              item,
+              settings,
+              prefetchedMetas,
+              ensuredDirs,
+              ctx
+            );
+            if (!ctx.isCurrent()) return;
             if (outcome === "uploaded") stats.uploaded++;
             else if (outcome === "downloaded") stats.downloaded++;
             else if (outcome === "deleted") stats.deleted++;
             else if (outcome === "conflict") stats.conflicts++;
             else if (outcome === "skipped") stats.skipped++;
           } catch (err: unknown) {
+            if (err instanceof BridgeDeadlockError || err instanceof QueueCancelledError) {
+              return;
+            }
+            if (!ctx.isCurrent()) return;
             stats.errors++;
             const msg = err instanceof Error ? err.message : String(err);
             this.addLog("error", t("engine.itemFailed", { path: item.path }), msg);
           } finally {
-            processed++;
-            this.setState("syncing", t("engine.syncProgress", { done: processed, total: totalOps }));
+            if (ctx.isCurrent()) {
+              processed++;
+              this.setState("syncing", t("engine.syncProgress", { done: processed, total: totalOps }));
+              const saved = await this.manifest.maybeCheckpoint(
+                this.checkpointItems,
+                this.checkpointIntervalMs
+              );
+              if (saved && ctx.isCurrent()) {
+                this.addLog(
+                  "info",
+                  t("engine.manifestCheckpoint", { done: processed, total: totalOps })
+                );
+              }
+            }
           }
         })
       );
 
-      await Promise.all(tasks);
-      await this.queue.waitAll();
+      const allTasksPromise = Promise.all(tasks);
+      // Suppress rejection from cancelled queue entries when abortPromise wins the race
+      allTasksPromise.catch(() => {});
 
-      // Step 5: Save manifest and sync timestamp
+      await Promise.race([allTasksPromise, ctx.abortPromise]);
+      if (!ctx.bridgeDead) {
+        await ctx.queue.waitAll();
+      }
+
+      // Step 5: Final manifest & settings save
       this.manifest.updateLastSyncTime();
       await this.manifest.save();
 
@@ -440,10 +709,27 @@ export class SyncEngine {
       this.setState("idle", t("engine.stateComplete"));
       return { success: stats.errors === 0, stats };
     } catch (err: unknown) {
+      if (err instanceof BridgeDeadlockError || ctx.bridgeDead) {
+        const msg = t("engine.bridgeDeadlock");
+        this.addLog("error", msg);
+        this.setState("error", msg);
+        return { success: false, stats, bridgeDead: true };
+      }
+
       const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
       this.addLog("error", t("engine.fatalError"), msg);
       this.setState("error", msg);
       return { success: false, stats };
+    } finally {
+      ctx.queue.clear();
+      // Best-effort flush of any completed items if bridge is still responsive
+      if (!ctx.bridgeDead && this.manifest.isDirty()) {
+        this.manifest.updateLastSyncTime();
+        await this.manifest.save();
+      }
+      if (this.activeRunId === runId) {
+        this.activeRunId = null;
+      }
     }
   }
 
@@ -470,27 +756,53 @@ export class SyncEngine {
     item: SyncPlanItem,
     settings: BaiduSyncSettings,
     prefetchedMetas: Map<string, BaiduFileMeta>,
-    ensuredDirs: Set<string>
+    ensuredDirs: Set<string>,
+    ctx: SyncRunContext
   ): Promise<"uploaded" | "downloaded" | "deleted" | "conflict" | "skipped" | "none"> {
     switch (item.action) {
       case "UPLOAD": {
-        if (!(await this.vault.exists(item.path))) {
-          return "none";
-        }
-        const stat = await this.vault.stat(item.path);
-        if (stat && this.isOversized(stat.size, settings, item.path)) {
+        if (item.local && this.isOversized(item.local.size, settings, item.path)) {
           return "skipped";
         }
-        const buffer = await this.vault.readBinary(item.path);
+
+        let buffer: ArrayBuffer;
+        try {
+          buffer = await ctx.readBinary(item.path);
+        } catch (err: unknown) {
+          if (
+            err instanceof BridgeDeadlockError ||
+            err instanceof OperationTimeoutError ||
+            err instanceof QueueCancelledError
+          ) {
+            throw err;
+          }
+          // File may have been deleted between scan and upload
+          if (!(await ctx.exists(item.path))) {
+            return "none";
+          }
+          throw err;
+        }
+
         if (this.isOversized(buffer.byteLength, settings, item.path)) {
           return "skipped";
         }
-        const localMtime = stat?.mtime || Date.now();
+
+        let localMtime = item.local?.mtime;
+        let localSize = item.local?.size ?? buffer.byteLength;
+        if (localMtime === undefined) {
+          const stat = await ctx.stat(item.path);
+          localMtime = stat?.mtime || Date.now();
+          localSize = stat?.size ?? buffer.byteLength;
+        }
 
         const res = await this.uploader.uploadFile(item.remotePath, buffer, {
           enableE2EE: settings.enableE2EE,
           e2eePassword: settings.e2eePassword
         });
+
+        if (!ctx.isCurrent()) {
+          return "none";
+        }
 
         this.manifest.set({
           path: item.path,
@@ -498,7 +810,7 @@ export class SyncEngine {
           mtime: localMtime,
           remoteMtime: (res.mtime || Math.floor(Date.now() / 1000)) * 1000,
           md5: res.md5 || "",
-          size: stat?.size ?? buffer.byteLength,
+          size: localSize,
           remoteSize: res.size,
           fsId: res.fs_id
         });
@@ -515,11 +827,18 @@ export class SyncEngine {
         }
 
         const buffer = await this.downloadItemBuffer(item, settings, prefetchedMetas);
+        if (!ctx.isCurrent()) {
+          return "none";
+        }
 
-        await this.ensureParentDir(item.path, ensuredDirs);
+        await this.ensureParentDir(item.path, ensuredDirs, ctx);
         this.markSyncWrite(item.path);
-        await this.vault.writeBinary(item.path, buffer);
-        const stat = await this.vault.stat(item.path);
+        await ctx.writeBinary(item.path, buffer);
+        const stat = await ctx.stat(item.path);
+
+        if (!ctx.isCurrent()) {
+          return "none";
+        }
 
         this.manifest.set({
           path: item.path,
@@ -547,13 +866,18 @@ export class SyncEngine {
         }
 
         const [localBuffer, remoteBuffer] = await Promise.all([
-          this.vault.readBinary(item.path),
+          ctx.readBinary(item.path),
           this.downloadItemBuffer(item, settings, prefetchedMetas)
         ]);
 
+        if (!ctx.isCurrent()) {
+          return "none";
+        }
+
         // If decrypted contents are byte-for-byte identical, skip creating any conflict copy
         if (buffersEqual(localBuffer, remoteBuffer)) {
-          const stat = await this.vault.stat(item.path);
+          const stat = await ctx.stat(item.path);
+          if (!ctx.isCurrent()) return "none";
           this.manifest.set({
             path: item.path,
             remotePath: item.remotePath,
@@ -568,22 +892,23 @@ export class SyncEngine {
           return "none";
         }
 
-        const conflictPath = await this.resolveUniqueConflictPath(item.path);
+        const conflictPath = await this.resolveUniqueConflictPath(item.path, ctx);
         const cleanBase = normalizeRemoteBase(settings.remoteBasePath);
         const conflictRemotePath = `${cleanBase}/${conflictPath}`;
         const winner = item.winner ?? (item.local.mtime >= item.remote.mtime ? "local" : "remote");
 
-        await this.ensureParentDir(conflictPath, ensuredDirs);
+        await this.ensureParentDir(conflictPath, ensuredDirs, ctx);
 
         if (winner === "local") {
           // Preserve remote version as conflict copy locally & remotely, then push local as main
           this.markSyncWrite(conflictPath);
-          await this.vault.writeBinary(conflictPath, remoteBuffer);
-          const conflictStat = await this.vault.stat(conflictPath);
+          await ctx.writeBinary(conflictPath, remoteBuffer);
+          const conflictStat = await ctx.stat(conflictPath);
           const conflictUploadRes = await this.uploader.uploadFile(conflictRemotePath, remoteBuffer, {
             enableE2EE: settings.enableE2EE,
             e2eePassword: settings.e2eePassword
           });
+          if (!ctx.isCurrent()) return "none";
           this.manifest.set({
             path: conflictPath,
             remotePath: conflictRemotePath,
@@ -595,11 +920,12 @@ export class SyncEngine {
             fsId: conflictUploadRes.fs_id
           });
 
-          const localStat = await this.vault.stat(item.path);
+          const localStat = await ctx.stat(item.path);
           const mainUploadRes = await this.uploader.uploadFile(item.remotePath, localBuffer, {
             enableE2EE: settings.enableE2EE,
             e2eePassword: settings.e2eePassword
           });
+          if (!ctx.isCurrent()) return "none";
           this.manifest.set({
             path: item.path,
             remotePath: item.remotePath,
@@ -613,12 +939,13 @@ export class SyncEngine {
         } else {
           // Preserve local version as conflict copy locally & remotely, then apply remote as main
           this.markSyncWrite(conflictPath);
-          await this.vault.writeBinary(conflictPath, localBuffer);
-          const conflictStat = await this.vault.stat(conflictPath);
+          await ctx.writeBinary(conflictPath, localBuffer);
+          const conflictStat = await ctx.stat(conflictPath);
           const conflictUploadRes = await this.uploader.uploadFile(conflictRemotePath, localBuffer, {
             enableE2EE: settings.enableE2EE,
             e2eePassword: settings.e2eePassword
           });
+          if (!ctx.isCurrent()) return "none";
           this.manifest.set({
             path: conflictPath,
             remotePath: conflictRemotePath,
@@ -631,8 +958,9 @@ export class SyncEngine {
           });
 
           this.markSyncWrite(item.path);
-          await this.vault.writeBinary(item.path, remoteBuffer);
-          const mainStat = await this.vault.stat(item.path);
+          await ctx.writeBinary(item.path, remoteBuffer);
+          const mainStat = await ctx.stat(item.path);
+          if (!ctx.isCurrent()) return "none";
           this.manifest.set({
             path: item.path,
             remotePath: item.remotePath,
@@ -650,7 +978,7 @@ export class SyncEngine {
       }
 
       case "UPDATE_MANIFEST": {
-        if (item.local && item.remote) {
+        if (item.local && item.remote && ctx.isCurrent()) {
           this.manifest.set({
             path: item.path,
             remotePath: item.remotePath,
@@ -666,17 +994,21 @@ export class SyncEngine {
       }
 
       case "DELETE_LOCAL": {
-        if (await this.vault.exists(item.path)) {
+        if (await ctx.exists(item.path)) {
           this.markSyncWrite(item.path);
-          await this.vault.trashFile(item.path);
+          await ctx.trashFile(item.path);
           this.addLog("info", t("engine.deleteLocalSuccess", { path: item.path }));
         }
-        this.manifest.delete(item.path);
+        if (ctx.isCurrent()) {
+          this.manifest.delete(item.path);
+        }
         return "deleted";
       }
 
       case "CLEAN_MANIFEST": {
-        this.manifest.delete(item.path);
+        if (ctx.isCurrent()) {
+          this.manifest.delete(item.path);
+        }
         return "none";
       }
 
@@ -688,7 +1020,7 @@ export class SyncEngine {
   async convertVaultToPlaintext(
     onProgress?: (processed: number, total: number, currentPath: string) => void
   ): Promise<{ success: boolean; total: number; skipped: number; errors: number }> {
-    if (this.state !== "idle" && this.state !== "error") {
+    if (this.activeRunId !== null || this.migrationActive || (this.state !== "idle" && this.state !== "error")) {
       throw new Error(t("migration.alreadyRunning"));
     }
 
@@ -697,100 +1029,154 @@ export class SyncEngine {
       throw new Error(t("migration.notAuthorized"));
     }
 
-    this.addLog("info", t("migration.step1Log"));
-    const pullResult = await this.startSync(false);
-    // Abort on ANY pre-sync failure (including fatal network errors where stats.errors may be 0)
-    if (!pullResult.success) {
-      throw new Error(t("migration.step1Failed", { errors: pullResult.stats.errors }));
-    }
-
-    this.filter.updateSettings(settings);
-    this.queue.setConcurrency(settings.concurrency || 3);
-
+    this.migrationActive = true;
     try {
-      this.setState("diffing", t("migration.scanningLocal"));
-      const localFiles = await this.scanLocalFiles();
-      const total = localFiles.size;
-      let processed = 0;
-      let skipped = 0;
-      let errors = 0;
+      this.addLog("info", t("migration.step1Log"));
+      const pullResult = await this.executeSyncRun(true);
+      // Abort on ANY pre-sync failure (including fatal network or bridge errors where stats.errors may be 0)
+      if (!pullResult.success) {
+        if (pullResult.bridgeDead) {
+          throw new Error(t("engine.bridgeDeadlock"));
+        }
+        throw new Error(t("migration.step1Failed", { errors: pullResult.stats.errors }));
+      }
 
-      this.addLog("info", t("migration.step2Log", { total }));
+      const runId = ++this.runSeq;
+      this.activeRunId = runId;
+      this.filter.updateSettings(settings);
+      const ctx = this.createRunContext(runId, settings.concurrency || 3);
 
-      const cleanBase = normalizeRemoteBase(settings.remoteBasePath);
-      this.setState("syncing", t("migration.step2Progress", { done: 0, total }));
+      try {
+        this.setState("diffing", t("migration.scanningLocal"));
+        const localFiles = await this.scanLocalFiles(ctx);
+        const total = localFiles.size;
+        let processed = 0;
+        let skipped = 0;
+        let errors = 0;
 
-      const entries = Array.from(localFiles.entries());
-      const tasks = entries.map(([path, fileInfo]) =>
-        this.queue.add(async () => {
-          try {
-            if (!(await this.vault.exists(path))) {
-              return;
+        this.addLog("info", t("migration.step2Log", { total }));
+
+        const cleanBase = normalizeRemoteBase(settings.remoteBasePath);
+        this.setState("syncing", t("migration.step2Progress", { done: 0, total }));
+
+        const entries = Array.from(localFiles.entries());
+        const tasks = entries.map(([path, fileInfo]) =>
+          ctx.queue.add(async () => {
+            if (!ctx.isCurrent()) return;
+            try {
+              if (this.isOversized(fileInfo.size, settings, path)) {
+                skipped++;
+                return;
+              }
+              let buffer: ArrayBuffer;
+              try {
+                buffer = await ctx.readBinary(path);
+              } catch (err: unknown) {
+                if (
+                  err instanceof BridgeDeadlockError ||
+                  err instanceof OperationTimeoutError ||
+                  err instanceof QueueCancelledError
+                ) {
+                  throw err;
+                }
+                if (!(await ctx.exists(path))) {
+                  return;
+                }
+                throw err;
+              }
+              if (this.isOversized(buffer.byteLength, settings, path)) {
+                skipped++;
+                return;
+              }
+              const localMtime = fileInfo.mtime || Date.now();
+              const remotePath = `${cleanBase}/${path}`;
+
+              // Explicitly upload with enableE2EE: false -> Pure Plaintext
+              const res = await this.uploader.uploadFile(remotePath, buffer, {
+                enableE2EE: false
+              });
+
+              if (!ctx.isCurrent()) return;
+
+              this.manifest.set({
+                path: path,
+                remotePath: remotePath,
+                mtime: localMtime,
+                remoteMtime: (res.mtime || Math.floor(Date.now() / 1000)) * 1000,
+                md5: res.md5 || "",
+                size: fileInfo.size ?? buffer.byteLength,
+                remoteSize: res.size,
+                fsId: res.fs_id
+              });
+              this.addLog("success", t("migration.uploadSuccess", { path }));
+            } catch (err: unknown) {
+              if (err instanceof BridgeDeadlockError || err instanceof QueueCancelledError) {
+                return;
+              }
+              if (!ctx.isCurrent()) return;
+              errors++;
+              const msg = err instanceof Error ? err.message : String(err);
+              this.addLog("error", t("migration.uploadFailed", { path }), msg);
+            } finally {
+              if (ctx.isCurrent()) {
+                processed++;
+                onProgress?.(processed, total, path);
+                this.setState("syncing", t("migration.step2Progress", { done: processed, total }));
+                await this.manifest.maybeCheckpoint(
+                  this.checkpointItems,
+                  this.checkpointIntervalMs
+                );
+              }
             }
-            if (this.isOversized(fileInfo.size, settings, path)) {
-              skipped++;
-              return;
-            }
-            const buffer = await this.vault.readBinary(path);
-            if (this.isOversized(buffer.byteLength, settings, path)) {
-              skipped++;
-              return;
-            }
-            const stat = await this.vault.stat(path);
-            const localMtime = stat?.mtime || Date.now();
-            const remotePath = `${cleanBase}/${path}`;
+          })
+        );
 
-            // Explicitly upload with enableE2EE: false -> Pure Plaintext
-            const res = await this.uploader.uploadFile(remotePath, buffer, {
-              enableE2EE: false
-            });
+        const allTasksPromise = Promise.all(tasks);
+        allTasksPromise.catch(() => {});
 
-            this.manifest.set({
-              path: path,
-              remotePath: remotePath,
-              mtime: localMtime,
-              remoteMtime: (res.mtime || Math.floor(Date.now() / 1000)) * 1000,
-              md5: res.md5 || "",
-              size: stat?.size ?? buffer.byteLength,
-              remoteSize: res.size,
-              fsId: res.fs_id
-            });
-            this.addLog("success", t("migration.uploadSuccess", { path }));
-          } catch (err: unknown) {
-            errors++;
-            const msg = err instanceof Error ? err.message : String(err);
-            this.addLog("error", t("migration.uploadFailed", { path }), msg);
-          } finally {
-            processed++;
-            onProgress?.(processed, total, path);
-            this.setState("syncing", t("migration.step2Progress", { done: processed, total }));
-          }
-        })
-      );
+        await Promise.race([allTasksPromise, ctx.abortPromise]);
+        if (!ctx.bridgeDead) {
+          await ctx.queue.waitAll();
+        }
 
-      await Promise.all(tasks);
-      await this.queue.waitAll();
+        this.manifest.updateLastSyncTime();
+        await this.manifest.save();
 
-      this.manifest.updateLastSyncTime();
-      await this.manifest.save();
+        settings.lastSyncTime = Date.now();
+        await this.saveSettings(settings);
 
-      settings.lastSyncTime = Date.now();
-      await this.saveSettings(settings);
+        this.setState("idle", t("migration.stateDone"));
+        const summary = t("migration.summary", { processed, total, skipped, errors });
+        this.addLog(errors > 0 ? "warn" : "success", summary);
 
-      this.setState("idle", t("migration.stateDone"));
-      const summary = t("migration.summary", { processed, total, skipped, errors });
-      this.addLog(errors > 0 ? "warn" : "success", summary);
-
-      return { success: errors === 0, total, skipped, errors };
-    } catch (err: unknown) {
-      const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
-      this.addLog("error", t("engine.fatalError"), msg);
-      this.setState("error", msg);
-      throw new Error(msg);
+        return { success: errors === 0, total, skipped, errors };
+      } catch (err: unknown) {
+        if (err instanceof BridgeDeadlockError || ctx.bridgeDead) {
+          const msg = t("engine.bridgeDeadlock");
+          this.addLog("error", msg);
+          this.setState("error", msg);
+          throw new Error(msg);
+        }
+        const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+        this.addLog("error", t("engine.fatalError"), msg);
+        this.setState("error", msg);
+        throw new Error(msg);
+      } finally {
+        ctx.queue.clear();
+        if (!ctx.bridgeDead && this.manifest.isDirty()) {
+          this.manifest.updateLastSyncTime();
+          await this.manifest.save();
+        }
+        if (this.activeRunId === runId) {
+          this.activeRunId = null;
+        }
+      }
+    } finally {
+      this.migrationActive = false;
     }
   }
 
-  private async scanLocalFiles(): Promise<Map<string, LocalFileInfo>> {
+  private async scanLocalFiles(ctx: SyncRunContext): Promise<Map<string, LocalFileInfo>> {
     const result = new Map<string, LocalFileInfo>();
     const visitedDirs = new Set<string>();
 
@@ -801,13 +1187,13 @@ export class SyncEngine {
       }
       visitedDirs.add(normDir);
 
-      const list = await this.vault.list(normDir);
+      const list = await ctx.list(normDir);
 
       for (const file of list.files) {
         if (this.filter.shouldIgnore(file)) {
           continue;
         }
-        const stat = await this.vault.stat(file);
+        const stat = await ctx.statFast(file);
         if (stat && stat.type === "file") {
           result.set(file, {
             path: file,
@@ -835,7 +1221,7 @@ export class SyncEngine {
       settings.syncObsidianConfig &&
       configDir &&
       !visitedDirs.has(configDir) &&
-      (await this.vault.exists(configDir))
+      (await ctx.exists(configDir))
     ) {
       await scanDirectory(configDir);
     }

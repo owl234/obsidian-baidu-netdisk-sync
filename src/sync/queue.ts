@@ -1,6 +1,18 @@
+export class QueueCancelledError extends Error {
+  constructor(message = "Queued task was cancelled") {
+    super(message);
+    this.name = "QueueCancelledError";
+  }
+}
+
+interface QueuedEntry {
+  run: () => Promise<void>;
+  cancel: (reason: Error) => void;
+}
+
 export class AsyncQueue {
   private activeCount = 0;
-  private queue: Array<() => Promise<void>> = [];
+  private queue: QueuedEntry[] = [];
   private idleResolvers: Array<() => void> = [];
 
   constructor(private concurrency: number = 3) {
@@ -12,32 +24,70 @@ export class AsyncQueue {
     this.next();
   }
 
+  getPendingCount(): number {
+    return this.queue.length;
+  }
+
+  getActiveCount(): number {
+    return this.activeCount;
+  }
+
   add<T>(task: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const runner = async () => {
-        try {
-          const res = await task();
-          resolve(res);
-        } catch (err) {
-          reject(err instanceof Error ? err : new Error(String(err)));
-        } finally {
-          this.activeCount--;
-          this.next();
-          this.checkIdle();
+      let settled = false;
+
+      const entry: QueuedEntry = {
+        run: async () => {
+          try {
+            const res = await task();
+            if (!settled) {
+              settled = true;
+              resolve(res);
+            }
+          } catch (err) {
+            if (!settled) {
+              settled = true;
+              reject(err instanceof Error ? err : new Error(String(err)));
+            }
+          } finally {
+            this.activeCount--;
+            this.next();
+            this.checkIdle();
+          }
+        },
+        cancel: (reason: Error) => {
+          if (!settled) {
+            settled = true;
+            reject(reason);
+          }
         }
       };
 
-      this.queue.push(runner);
+      this.queue.push(entry);
       this.next();
     });
   }
 
+  /**
+   * Immediately cancels all unstarted tasks in the queue so callers awaiting them
+   * unblock without waiting for thousands of remaining items.
+   */
+  clear(reason?: Error): number {
+    const cancelled = this.queue.splice(0, this.queue.length);
+    const err = reason ?? new QueueCancelledError();
+    for (const entry of cancelled) {
+      entry.cancel(err);
+    }
+    this.checkIdle();
+    return cancelled.length;
+  }
+
   private next(): void {
     while (this.activeCount < this.concurrency && this.queue.length > 0) {
-      const task = this.queue.shift();
-      if (task) {
+      const entry = this.queue.shift();
+      if (entry) {
         this.activeCount++;
-        void task();
+        void entry.run();
       }
     }
   }

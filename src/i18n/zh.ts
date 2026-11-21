@@ -96,6 +96,10 @@ export const zh: Record<TranslationKey, string> = {
   "engine.conflictPreserved": "检测到冲突，已保留主文件 {path} 并将旧版本另存为 {conflictPath}",
   "engine.skippedMaxSize": "已跳过超大文件 ({sizeMB} MB > 上限 {limitMB} MB): {path}",
   "engine.listallFallback": "递归列举接口不可用 (errno: {errno})，自动降级为逐目录扫描。",
+  "engine.vaultTimeoutProbing": "本地文件操作超时 ({op}, {seconds}s)，正在探测底层文件系统桥接状态...",
+  "engine.bridgeProbeAlive": "文件系统桥接响应正常，跳过本次超时操作 ({op}) 并继续同步。",
+  "engine.bridgeDeadlock": "检测到移动端底层文件系统桥接已无响应，已安全中止本轮同步并保留最近一次增量进度。请彻底重启 Obsidian 后继续同步。",
+  "engine.manifestCheckpoint": "已增量保存同步进度检查点 ({done}/{total})。",
 
   // Plaintext migration
   "migration.alreadyRunning": "已有同步任务正在运行，请等待当前任务完成。",
@@ -158,8 +162,14 @@ export const zh: Record<TranslationKey, string> = {
   "settings.syncPlugins.desc": "开启后将在多端同步已安装的社区插件",
   "settings.syncThemes.name": "同步外观、主题与 CSS 片段 ({configDir}/themes & snippets)",
   "settings.syncThemes.desc": "开启后同步已下载的主题与自定义 CSS 片段",
-  "settings.ignoredPatterns.name": "排除规则 (Ignored Patterns)",
-  "settings.ignoredPatterns.desc": "每行一条 Glob 匹配规则，匹配的文件将完全不参与同步",
+  "settings.ignoredPatterns.name": "全局排除规则 (Global Ignored Patterns)",
+  "settings.ignoredPatterns.desc": "每行一条 Glob 匹配规则，匹配的文件将不参与同步（会随跨设备快速配对码导出/导入）",
+  "settings.localIgnoredPatterns.name": "本机专属排除规则 (仅当前设备生效)",
+  "settings.localIgnoredPatterns.desc": "与全局规则合并生效，但绝不会随跨设备配对码导出或被导入覆盖。适合在手机端跳过超大附件目录，同时保留电脑端全量备份。",
+  "settings.localIgnoredPatterns.placeholder": "示例:\n**/attachments/**\n**/*.mp4",
+  "settings.localIgnoredPatterns.presetBtn": "一键追加常见大体积媒体/附件规则",
+  "settings.localIgnoredPatterns.presetAddedNotice": "已为当前设备追加常见媒体与附件目录排除规则。",
+  "settings.localIgnoredPatterns.presetAlreadyPresentNotice": "当前设备的专属排除规则中已包含全部预设项。",
 
   "settings.sec5.heading": "5. 同步触发机制",
   "settings.syncOnStartup.name": "启动时自动同步",

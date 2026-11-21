@@ -238,6 +238,54 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           });
       });
 
+    let localIgnoreAreaEl: HTMLTextAreaElement | null = null;
+    const presetLocalPatterns = [
+      "**/attachments/**",
+      "**/assets/**",
+      "**/*.mp4",
+      "**/*.mov",
+      "**/*.zip"
+    ];
+
+    new Setting(containerEl)
+      .setName(t("settings.localIgnoredPatterns.name"))
+      .setDesc(t("settings.localIgnoredPatterns.desc"))
+      .addTextArea((area) => {
+        area.inputEl.rows = 4;
+        area.inputEl.addClass("baidu-sync-textarea");
+        localIgnoreAreaEl = area.inputEl;
+        area
+          .setPlaceholder(t("settings.localIgnoredPatterns.placeholder"))
+          .setValue(this.plugin.settings.localIgnoredPatterns || "")
+          .onChange(async (val) => {
+            this.plugin.settings.localIgnoredPatterns = val;
+            await this.plugin.saveSettings();
+          });
+      })
+      .addButton((btn) =>
+        btn.setButtonText(t("settings.localIgnoredPatterns.presetBtn")).onClick(async () => {
+          const existingLines = (this.plugin.settings.localIgnoredPatterns || "")
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+          const existingSet = new Set(existingLines);
+          const toAdd = presetLocalPatterns.filter((p) => !existingSet.has(p));
+
+          if (toAdd.length === 0) {
+            new Notice(t("settings.localIgnoredPatterns.presetAlreadyPresentNotice"));
+            return;
+          }
+
+          const updated = [...existingLines, ...toAdd].join("\n");
+          this.plugin.settings.localIgnoredPatterns = updated;
+          await this.plugin.saveSettings();
+          if (localIgnoreAreaEl) {
+            localIgnoreAreaEl.value = updated;
+          }
+          new Notice(t("settings.localIgnoredPatterns.presetAddedNotice"));
+        })
+      );
+
     // Section 5: Trigger Settings
     new Setting(containerEl).setName(t("settings.sec5.heading")).setHeading();
 

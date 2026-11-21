@@ -76,7 +76,8 @@ export class SyncFilter {
 
   private recompilePatterns(): void {
     this.compiledPatterns = [];
-    const lines = this.settings.ignoredPatterns.split("\n");
+    const combined = `${this.settings.ignoredPatterns || ""}\n${this.settings.localIgnoredPatterns || ""}`;
+    const lines = combined.split("\n");
     for (const line of lines) {
       const trimmed = line.trim();
       if (trimmed && !trimmed.startsWith("#")) {

@@ -94,6 +94,10 @@ export const en = {
   "engine.conflictPreserved": "Conflict preserved for {path}; backup saved to {conflictPath}",
   "engine.skippedMaxSize": "Skipped oversized file ({sizeMB} MB > limit {limitMB} MB): {path}",
   "engine.listallFallback": "Recursive listing unavailable (errno: {errno}); falling back to directory scan.",
+  "engine.vaultTimeoutProbing": "Local file operation timed out ({op}, {seconds}s); probing filesystem bridge...",
+  "engine.bridgeProbeAlive": "Filesystem bridge is responsive; skipping timed-out operation ({op}).",
+  "engine.bridgeDeadlock": "Local filesystem bridge stopped responding. Sync was paused safely after saving the latest checkpoint. Please restart Obsidian to resume.",
+  "engine.manifestCheckpoint": "Saved sync progress checkpoint ({done}/{total}).",
 
   // Plaintext migration
   "migration.alreadyRunning": "A sync task is already running. Please wait for it to finish.",
@@ -156,8 +160,14 @@ export const en = {
   "settings.syncPlugins.desc": "Sync installed third-party plugins across devices",
   "settings.syncThemes.name": "Sync themes and CSS snippets ({configDir}/themes & snippets)",
   "settings.syncThemes.desc": "Sync installed themes and custom CSS snippets across devices",
-  "settings.ignoredPatterns.name": "Ignored patterns",
-  "settings.ignoredPatterns.desc": "One glob pattern per line; matching files are excluded from sync",
+  "settings.ignoredPatterns.name": "Global ignored patterns",
+  "settings.ignoredPatterns.desc": "One glob pattern per line; excluded from sync and included in multi-device pairing exports",
+  "settings.localIgnoredPatterns.name": "Device-only ignored patterns",
+  "settings.localIgnoredPatterns.desc": "Applies only to this device and is never exported or overwritten during device pairing. Useful on mobile to skip large attachment folders while desktop keeps backing them up.",
+  "settings.localIgnoredPatterns.placeholder": "Example:\n**/attachments/**\n**/*.mp4",
+  "settings.localIgnoredPatterns.presetBtn": "Add common media and attachment rules",
+  "settings.localIgnoredPatterns.presetAddedNotice": "Added common media and attachment ignore rules for this device.",
+  "settings.localIgnoredPatterns.presetAlreadyPresentNotice": "All preset rules are already in your device-only ignore list.",
 
   "settings.sec5.heading": "5. Sync triggers",
   "settings.syncOnStartup.name": "Sync on startup",

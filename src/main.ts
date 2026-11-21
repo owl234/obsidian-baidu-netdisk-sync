@@ -6,19 +6,25 @@ import { BaiduClient } from "./baidu/client";
 import { HttpRequestFn, HttpRequestParam, HttpResponse } from "./baidu/types";
 import { ManifestManager } from "./sync/manifest";
 import { SyncEngine, VaultSyncBridge } from "./sync/engine";
+import { HTTP_REQUEST_TIMEOUT_MS, withTimeout } from "./sync/timeout";
 import { StatusBarManager } from "./ui/statusBar";
 import { SyncLogModal } from "./ui/logModal";
 import { clearKeyCache } from "./crypto/e2ee";
 import { initLocale, t } from "./i18n";
 
 const obsidianHttpRequest: HttpRequestFn = async (param: HttpRequestParam): Promise<HttpResponse> => {
-  const resp = await requestUrl({
-    url: param.url,
-    method: param.method,
-    headers: param.headers,
-    body: param.body,
-    throw: param.throw ?? false
-  });
+  const resp = await withTimeout(
+    requestUrl({
+      url: param.url,
+      method: param.method,
+      headers: param.headers,
+      body: param.body,
+      throw: param.throw ?? false
+    }),
+    HTTP_REQUEST_TIMEOUT_MS,
+    `requestUrl.${param.method || "GET"}`,
+    "http"
+  );
   return {
     status: resp.status,
     headers: resp.headers,
@@ -72,6 +78,17 @@ export default class BaiduSyncPlugin extends Plugin {
           size: s.size
         };
       },
+      statFast: async (path: string) => {
+        const abstractFile = this.app.vault.getAbstractFileByPath(path);
+        if (abstractFile && abstractFile instanceof TFile && abstractFile.stat) {
+          return {
+            type: "file",
+            mtime: abstractFile.stat.mtime,
+            size: abstractFile.stat.size
+          };
+        }
+        return vaultBridge.stat(path);
+      },
       list: (dir: string) => this.app.vault.adapter.list(dir),
       mkdir: (path: string) => this.app.vault.adapter.mkdir(path),
       readBinary: (path: string) => this.app.vault.adapter.readBinary(path),
@@ -116,18 +133,22 @@ export default class BaiduSyncPlugin extends Plugin {
       const res = await this.engine.startSync(false);
       if (res.success) {
         new Notice(t("notice.syncSuccess"));
-      } else {
+      } else if (!res.bridgeDead) {
         new Notice(t("notice.syncFailed"));
       }
     });
 
-    this.unsubscribeRibbonState = this.engine.onStateChange((state) => {
+    this.unsubscribeRibbonState = this.engine.onStateChange((state, message) => {
       if (this.ribbonIconEl) {
         if (state === "syncing" || state === "diffing" || state === "preparing") {
           this.ribbonIconEl.addClass("baidu-sync-spinning");
         } else {
           this.ribbonIconEl.removeClass("baidu-sync-spinning");
         }
+      }
+
+      if (state === "error" && message === t("engine.bridgeDeadlock")) {
+        new Notice(message, 12000);
       }
 
       if (state === "idle" && this.pendingSaveSync) {

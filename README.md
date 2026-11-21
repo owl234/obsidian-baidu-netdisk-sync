@@ -25,7 +25,7 @@
 2. **📱 真正的全平台覆盖与移动端友好**
    - 完美适配 **iOS (iPhone/iPad)、Android 手机/平板、macOS、Windows 和 Linux**。
    - 彻底摆脱第三方海外 WebDAV 线路受阻、网络抖动、单月上传流量限额以及移动端 Git 操作门槛高的难题。
-   - 内置**可配置单文件体积上限（默认 100 MB）**，避免移动端同步超大附件引发 WebView 内存溢出闪退。
+   - 内置**可配置单文件体积上限（默认 100 MB）**、**移动端大库防死锁保护**（分级超时、底层桥接探活熔断、每 25 文件 / 20 秒增量进度落盘、零 IPC 内存索引扫描）及**本机专属排除规则**（手机可单独跳过超大附件目录，电脑继续全量备份）。
 3. **⚡ 独创一键跨端配置迁移 (Multi-Device Fast Pairing)**
    - 仅需在电脑端完成一次百度网盘授权，点击即可生成受 **AES-256-GCM 独立临时密码保护的配对码**。
    - 手机/平板端一键粘贴导入，无需在移动端重复申请开发者账号或跳转浏览器授权，秒级完成多端组网。
@@ -41,7 +41,7 @@
 - ⚡ **高速协议调度、真并发与极速秒传**：支持 1~5 路真并发传输、`listall` 递归拉取（带 `list` 自动降级回退）、100 条批量 `filemetas` 与批量删除、4MB 动态切片与 `content-md5`/`slice-md5` 云端秒传，同时具备 64 位 `fs_id` 精度保护与 OAuth 单飞刷新重试。
 - 🛡️ **零数据丢失冲突保护 (Conflict Copy + LWW)**：内置 3-Way 差异规划引擎与无清单明文 MD5 去重；多设备并发编辑冲突时**默认自动保留冲突副本**（`*.conflict-YYYYMMDD-HHmmss.*`）防止静默覆盖丢稿，也可按需在设置中切换为 LWW 最新时间覆盖。
 - ♻️ **双向防误删保护 (Dual Trash)**：本地删除移入 Obsidian 回收站 (`.trash`)，云端删除进入百度网盘回收站，杜绝误操作丢失资产。
-- 🧩 **精细配置同步与过滤**：自由选择同步 `.obsidian/` 下的插件、主题与 CSS 片段 (`snippets/`)，精确排除本插件敏感目录及 `workspace*.json` 设备缓存，不误伤普通笔记。
+- 🧩 **精细配置同步与双层过滤**：自由选择同步 `.obsidian/` 下的插件、主题与 CSS 片段 (`snippets/`)，精确排除本插件敏感目录及 `workspace*.json` 设备缓存；同时区分**全局排除规则**与**本机专属排除规则**（绝不随配对码覆盖，便于手机端跳过大体积附件目录）。
 - 🚀 **多样触发矩阵**：支持侧边栏图标、状态栏、快捷命令、启动自动同步、定时后台轮询，以及覆盖修改/创建/删除/重命名的防抖自动同步（含回写抑制防 ping-pong 循环）。
 
 ---
@@ -117,7 +117,7 @@ npm run build
    - No rented VPS servers, complex S3 bucket egress fees, or NAS port forwarding. Standard personal Baidu accounts provide massive storage (up to 2TB) at zero monetary cost.
 2. **📱 True Cross-Platform, Mobile-First Design**
    - Seamlessly supports **iOS (iPhone/iPad), Android, macOS, Windows, and Linux**.
-   - Built-in **configurable single-file size guard (default 100 MB)** protects mobile WebViews from out-of-memory crashes when vaults contain oversized media files.
+   - Built-in **configurable single-file size guard (default 100 MB)**, **large-vault mobile anti-deadlock protection** (tiered FS/HTTP timeouts, Capacitor bridge health-probe circuit breaker, incremental manifest checkpoints every 25 items / 20s, and zero-IPC in-memory `TFile.stat` scanning), plus **device-only ignore rules** so mobile can skip heavy attachment folders while desktop keeps backing them up.
 3. **⚡ One-Click Multi-Device Pairing**
    - Authorize once on your PC, then click **Export configuration** to generate an **AES-256-GCM encrypted pairing code** protected by a separate temporary PIN.
    - Paste into your phone or tablet to link devices in seconds without repeated OAuth logins on mobile screens.
@@ -133,7 +133,7 @@ npm run build
 - ⚡ **High-Speed Protocol, True Concurrency & Rapid Upload**: 1–5 concurrent transfer workers, recursive `listall` listing (with automatic `list` BFS fallback), batched `filemetas` & remote deletes (100 items/call), 4MB chunked uploads with `content-md5`/`slice-md5` rapid upload, 64-bit `fs_id` precision safety, and deduplicated OAuth refresh-and-retry.
 - 🛡️ **Zero-Data-Loss Conflict Protection**: 3-Way diff planner with manifestless plaintext MD5 deduplication. Concurrent edits **default to preserving conflict backup copies** (`*.conflict-YYYYMMDD-HHmmss.*`), with an option to switch back to Last-Write-Wins (LWW).
 - ♻️ **Dual Trash Protection**: Local deletions go to Obsidian's `.trash`; remote deletions go to Baidu Netdisk's Recycle Bin.
-- 🧩 **Granular Config Sync**: Selectively sync `.obsidian/` plugins, themes, and CSS `snippets/` while excluding workspace caches and plugin credentials.
+- 🧩 **Granular Config Sync & Per-Device Ignore Rules**: Selectively sync `.obsidian/` plugins, themes, and CSS `snippets/` while excluding workspace caches and plugin credentials. Combine global ignore rules with **device-only ignore patterns** (never exported or overwritten during device pairing).
 - 🚀 **Rich Trigger Options**: Ribbon icon, status bar, command palette, startup sync, periodic polling, and debounced save sync (covering modify, create, delete, and rename with echo suppression).
 
 ---

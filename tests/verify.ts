@@ -1,10 +1,19 @@
 import assert from "assert";
+
+// Provide minimal browser timer shim for Node test runner (matches Obsidian renderer window API)
+if (typeof window === "undefined") {
+  (globalThis as unknown as { window: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout } }).window = {
+    setTimeout,
+    clearTimeout
+  };
+}
 import { md5 } from "../src/crypto/md5";
 import { SyncPlanner, LocalFileInfo, RemoteFileInfo, buildConflictPath } from "../src/sync/planner";
 import { SyncFilter, globToRegex } from "../src/sync/filter";
-import { AsyncQueue } from "../src/sync/queue";
+import { AsyncQueue, QueueCancelledError } from "../src/sync/queue";
 import { ManifestManager, ManifestStorageAdapter } from "../src/sync/manifest";
 import { SyncEngine, VaultSyncBridge } from "../src/sync/engine";
+import { OperationTimeoutError } from "../src/sync/timeout";
 import { BaiduSyncSettings, DEFAULT_SETTINGS } from "../src/settings/settings";
 import { exportEncryptedConfig, importEncryptedConfig } from "../src/crypto/configShare";
 import {
@@ -230,12 +239,23 @@ function testFilter() {
   assert.strictEqual(noThemesFilter.shouldIgnore(".obsidian/snippets"), true);
   assert.strictEqual(noThemesFilter.shouldIgnore(".obsidian/snippets/custom.css"), true);
 
-  // Regular notes & custom patterns
+  // Regular notes & custom patterns (global + device-only localIgnoredPatterns)
   assert.strictEqual(filter.shouldIgnore("Notes/Daily.md"), false);
-  const customFilter = new SyncFilter({ ...DEFAULT_SETTINGS, ignoredPatterns: "**/*.secret\ntemp/**" }, ".obsidian");
+  const customFilter = new SyncFilter(
+    {
+      ...DEFAULT_SETTINGS,
+      ignoredPatterns: "**/*.secret\ntemp/**",
+      localIgnoredPatterns: "**/attachments/**\n**/*.mp4"
+    },
+    ".obsidian"
+  );
   assert.strictEqual(customFilter.shouldIgnore("sub/test.secret"), true);
   assert.strictEqual(customFilter.shouldIgnore("temp/file.txt"), true);
   assert.strictEqual(customFilter.shouldIgnore("temp2/file.txt"), false);
+  assert.strictEqual(customFilter.shouldIgnore("attachments/photo.png"), true);
+  assert.strictEqual(customFilter.shouldIgnore("Media/attachments/clip.jpg"), true);
+  assert.strictEqual(customFilter.shouldIgnore("Videos/demo.mp4"), true);
+  assert.strictEqual(customFilter.shouldIgnore("Notes/keep.md"), false);
 
   console.log("   SyncFilter tests passed!");
 }
@@ -344,7 +364,25 @@ async function testAsyncQueueConcurrency() {
   await queue.waitAll();
   assert.strictEqual(maxObserved, 3, `Expected max concurrency 3, observed ${maxObserved}`);
   assert.strictEqual(active, 0);
-  console.log("   AsyncQueue concurrency tests passed!");
+
+  // Verify clear() immediately rejects unstarted queued tasks with QueueCancelledError
+  const cancelQueue = new AsyncQueue(1);
+  let releaseFirst!: () => void;
+  const firstDone = cancelQueue.add(
+    () =>
+      new Promise<string>((resolve) => {
+        releaseFirst = () => resolve("first");
+      })
+  );
+  const queuedTask = cancelQueue.add(async () => "never-runs");
+  const clearedCount = cancelQueue.clear();
+  assert.strictEqual(clearedCount, 1);
+  await assert.rejects(() => queuedTask, (err: unknown) => err instanceof QueueCancelledError);
+  releaseFirst();
+  assert.strictEqual(await firstDone, "first");
+  await cancelQueue.waitAll();
+
+  console.log("   AsyncQueue concurrency & cancellation tests passed!");
 }
 
 async function testE2EEv2AndLegacyV1() {
@@ -422,6 +460,7 @@ async function testConfigShare() {
     tokenExpiresAt: 1735689600000,
     remoteBasePath: "/apps/test_sync",
     conflictStrategy: "copy",
+    localIgnoredPatterns: "**/attachments/**\n**/*.mp4",
     maxFileSizeMB: 50,
     concurrency: 4,
     enableE2EE: true,
@@ -437,6 +476,11 @@ async function testConfigShare() {
   assert.strictEqual(imported.conflictStrategy, "copy");
   assert.strictEqual(imported.maxFileSizeMB, 50);
   assert.strictEqual(imported.e2eePassword, "MyMasterVaultPassword!");
+  assert.strictEqual(
+    "localIgnoredPatterns" in imported,
+    false,
+    "Device-only localIgnoredPatterns must NEVER be exported in pairing config"
+  );
 
   // Wrong PIN
   await assert.rejects(() => importEncryptedConfig(pairingCode, "WrongPin"));
@@ -796,6 +840,299 @@ async function testSyncEngineIntegration() {
   console.log("   SyncEngine integration tests passed!");
 }
 
+async function testBridgeDeadlockCheckpointsAndFastScan() {
+  console.log("-> Testing Issue #1 protections (tiered timeout, bridge probe circuit-breaker, incremental manifest checkpoints, re-entrancy guard, HTTP timeout retry, statFast)...");
+
+  // 1. HTTP timeout retry in BaiduClient
+  {
+    let settings: BaiduSyncSettings = {
+      ...DEFAULT_SETTINGS,
+      appKey: "k",
+      appSecret: "s",
+      accessToken: "TOK",
+      refreshToken: "REF",
+      tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000
+    };
+    let attempts = 0;
+    const flakyHttp: HttpRequestFn = async () => {
+      attempts++;
+      if (attempts === 1) {
+        // Simulate hung HTTP socket on attempt 1
+        return new Promise<HttpResponse>(() => {});
+      }
+      return makeJsonResponse({ errno: 0, has_more: 0, list: [] });
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, flakyHttp);
+    const client = new BaiduClient(oauth, flakyHttp, { delayFn: zeroDelay, requestTimeoutMs: 30 });
+    const items = await client.listAll("/apps/obsidian_vault");
+    assert.strictEqual(items.length, 0);
+    assert.strictEqual(attempts, 2, "Hung HTTP request should time out and retry automatically");
+  }
+
+  // 2. ManifestManager.load() must rethrow OperationTimeoutError instead of silently wiping baseline
+  {
+    const hangingAdapter: ManifestStorageAdapter = {
+      exists: () => new Promise<boolean>(() => {}),
+      mkdir: async () => {},
+      read: async () => "",
+      write: async () => {}
+    };
+    const mgr = new ManifestManager(hangingAdapter, ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json", {
+      adapterTimeoutMs: 25
+    });
+    await assert.rejects(
+      () => mgr.load(),
+      (err: unknown) => err instanceof OperationTimeoutError,
+      "Manifest load timeout must not be swallowed as empty manifest"
+    );
+  }
+
+  // 3. Single timed-out file on a healthy bridge: probe passes -> skip file, finish remaining uploads, use statFast
+  {
+    const baseVault = createMemoryVault(".obsidian");
+    const nowSec = Math.floor(Date.now() / 1000);
+    baseVault.seedFile("ok1.md", "hello 1", nowSec * 1000);
+    baseVault.seedFile("slow.md", "stuck file", nowSec * 1000);
+    baseVault.seedFile("ok2.md", "hello 2", nowSec * 1000);
+
+    let rawStatCalls = 0;
+    let fastStatCalls = 0;
+    const instrumentedVault: VaultSyncBridge & ManifestStorageAdapter = {
+      ...baseVault,
+      stat: async (path: string) => {
+        rawStatCalls++;
+        return baseVault.stat(path);
+      },
+      statFast: async (path: string) => {
+        fastStatCalls++;
+        return baseVault.stat(path);
+      },
+      readBinary: async (path: string) => {
+        if (path === "slow.md") {
+          return new Promise<ArrayBuffer>(() => {});
+        }
+        return baseVault.readBinary(path);
+      }
+    };
+
+    let settings: BaiduSyncSettings = {
+      ...DEFAULT_SETTINGS,
+      appKey: "k",
+      appSecret: "s",
+      accessToken: "TOK",
+      refreshToken: "REF",
+      tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      syncObsidianConfig: false,
+      concurrency: 2
+    };
+
+    const mockHttp: HttpRequestFn = async (param: HttpRequestParam) => {
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({ errno: 0, has_more: 0, list: [] });
+      }
+      if (param.url.includes("method=precreate")) {
+        const params = new URLSearchParams(String(param.body || ""));
+        const p = params.get("path") || "";
+        return makeJsonResponse({
+          errno: 0,
+          return_type: 2,
+          uploadid: "",
+          block_list: [],
+          info: {
+            fs_id: String(Math.floor(Math.random() * 1e12)),
+            path: p,
+            size: Number(params.get("size") || 0),
+            mtime: nowSec + 5,
+            md5: params.get("content-md5") || ""
+          }
+        });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    const manifestMgr = new ManifestManager(instrumentedVault, manifestPath, { adapterTimeoutMs: 100 });
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+    const engine = new SyncEngine(
+      instrumentedVault,
+      () => settings,
+      async (s) => { settings = s; },
+      client,
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync",
+      { fsMetaTimeoutMs: 40, fsBinaryTimeoutMs: 40, bridgeProbeTimeoutMs: 40 }
+    );
+
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.bridgeDead, undefined, "Healthy bridge probe must not trip circuit breaker");
+    assert.strictEqual(res.stats.uploaded, 2, "Remaining healthy files must still upload");
+    assert.strictEqual(res.stats.errors, 1, "Single timed-out file must be counted as 1 error");
+    assert.strictEqual(engine.getState(), "idle", "Engine must return to idle after single-file timeout");
+    assert.strictEqual(fastStatCalls, 3, "scanLocalFiles must use zero-IPC statFast");
+    assert.strictEqual(rawStatCalls, 0, "Raw adapter.stat must NOT be called during fast local scan + upload");
+  }
+
+  // 4. Wedged Capacitor bridge deadlock + incremental manifest checkpoint + queue abort + resume + re-entrancy guard
+  {
+    const baseVault = createMemoryVault(".obsidian");
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (let i = 1; i <= 10; i++) {
+      const name = `f${String(i).padStart(2, "0")}.md`;
+      baseVault.seedFile(name, `content-${i}`, nowSec * 1000);
+    }
+
+    let bridgeWedged = false;
+    let readAttemptsAfterWedge = 0;
+    let manifestWriteCount = 0;
+    let uploadedCount = 0;
+    const remoteItems = new Map<string, { fs_id: string; path: string; size: number; mtime: number; md5: string }>();
+
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    const wedgingVault: VaultSyncBridge & ManifestStorageAdapter = {
+      ...baseVault,
+      exists: async (path: string) => {
+        if (bridgeWedged) return new Promise<boolean>(() => {});
+        return baseVault.exists(path);
+      },
+      statFast: async (path: string) => baseVault.stat(path),
+      readBinary: async (path: string) => {
+        if (bridgeWedged) {
+          readAttemptsAfterWedge++;
+          return new Promise<ArrayBuffer>(() => {});
+        }
+        if (path === "f05.md") {
+          bridgeWedged = true;
+          return new Promise<ArrayBuffer>(() => {});
+        }
+        return baseVault.readBinary(path);
+      },
+      write: async (path: string, data: string) => {
+        if (bridgeWedged) return new Promise<void>(() => {});
+        if (path === manifestPath) manifestWriteCount++;
+        return baseVault.write(path, data);
+      }
+    };
+
+    let settings: BaiduSyncSettings = {
+      ...DEFAULT_SETTINGS,
+      appKey: "k",
+      appSecret: "s",
+      accessToken: "TOK",
+      refreshToken: "REF",
+      tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      syncObsidianConfig: false,
+      conflictStrategy: "lww",
+      enableE2EE: true,
+      e2eePassword: "TestE2eePassword!123",
+      concurrency: 1
+    };
+
+    const mockHttp: HttpRequestFn = async (param: HttpRequestParam) => {
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({
+          errno: 0,
+          has_more: 0,
+          list: Array.from(remoteItems.values()).map((r) => ({
+            fs_id: r.fs_id,
+            path: r.path,
+            server_filename: r.path.split("/").pop() || "",
+            size: r.size,
+            isdir: 0,
+            server_mtime: r.mtime,
+            server_ctime: r.mtime,
+            md5: r.md5
+          }))
+        });
+      }
+      if (param.url.includes("method=precreate")) {
+        await new Promise((r) => setTimeout(r, 5));
+        const params = new URLSearchParams(String(param.body || ""));
+        const p = params.get("path") || "";
+        const size = Number(params.get("size") || 0);
+        const contentMd5 = params.get("content-md5") || "";
+        const fsId = String(100000 + ++uploadedCount);
+        remoteItems.set(p, { fs_id: fsId, path: p, size, mtime: nowSec, md5: contentMd5 });
+        return makeJsonResponse({
+          errno: 0,
+          return_type: 2,
+          uploadid: "",
+          block_list: [],
+          info: { fs_id: fsId, path: p, size, mtime: nowSec, md5: contentMd5 }
+        });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+
+    const manifestMgr = new ManifestManager(wedgingVault, manifestPath, {
+      adapterTimeoutMs: 50,
+      checkpointItemThreshold: 3,
+      checkpointIntervalMs: 60_000
+    });
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+    const engine = new SyncEngine(
+      wedgingVault,
+      () => settings,
+      async (s) => { settings = s; },
+      client,
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync",
+      {
+        fsMetaTimeoutMs: 40,
+        fsBinaryTimeoutMs: 40,
+        bridgeProbeTimeoutMs: 30,
+        checkpointItems: 3,
+        checkpointIntervalMs: 60_000
+      }
+    );
+
+    // Fire concurrent second trigger immediately -> must be rejected by re-entrancy guard
+    const run1Promise = engine.startSync(false);
+    const concurrentTrigger = await engine.startSync(true);
+    assert.strictEqual(concurrentTrigger.success, false, "Concurrent startSync trigger must be blocked");
+
+    const run1 = await run1Promise;
+    assert.strictEqual(run1.success, false);
+    assert.strictEqual(run1.bridgeDead, true, "Wedged Capacitor bridge must trip circuit breaker");
+    assert.strictEqual(engine.getState(), "error", "Engine state must transition to error, never stuck in syncing");
+    assert.strictEqual(readAttemptsAfterWedge, 0, "Remaining queued files must be cancelled immediately without dispatch");
+    assert.ok(manifestWriteCount >= 1, `Expected incremental manifest checkpoint before wedge, got ${manifestWriteCount}`);
+
+    // Simulate process restart: un-wedge bridge and load manifest strictly from disk
+    bridgeWedged = false;
+    const reloadedManifest = new ManifestManager(baseVault, manifestPath);
+    await reloadedManifest.load();
+    const persistedKeys = Object.keys(reloadedManifest.getAll());
+    assert.ok(
+      persistedKeys.length >= 3,
+      `Expected >= 3 files persisted to disk via incremental checkpoint, found ${persistedKeys.length}`
+    );
+
+    // Resume sync after restart (E2EE enabled, so MD5 dedup is off) ->
+    // MUST skip the 3 already-checkpointed files (f01..f03) and only handle remaining 7!
+    const uploadsBeforeResume = uploadedCount;
+    const resumedEngine = new SyncEngine(
+      baseVault,
+      () => settings,
+      async (s) => { settings = s; },
+      client,
+      reloadedManifest,
+      ".obsidian/plugins/baidu-netdisk-sync",
+      { checkpointItems: 3 }
+    );
+    const run2 = await resumedEngine.startSync(false);
+    assert.strictEqual(run2.success, true, "Resumed sync after bridge recovery must succeed");
+    assert.strictEqual(
+      uploadedCount - uploadsBeforeResume,
+      10 - persistedKeys.length,
+      `Expected resumed E2EE sync to skip ${persistedKeys.length} checkpointed files and upload ${10 - persistedKeys.length}, uploaded ${uploadedCount - uploadsBeforeResume}`
+    );
+  }
+
+  console.log("   Issue #1 deadlock protection, checkpoint & fast-scan tests passed!");
+}
+
 async function runAll() {
   testMD5();
   testI18n();
@@ -806,6 +1143,7 @@ async function runAll() {
   await testConfigShare();
   await testBaiduProtocolAndSafety();
   await testSyncEngineIntegration();
+  await testBridgeDeadlockCheckpointsAndFastScan();
   console.log("🎉 All unit & integration tests passed successfully!");
 }
 
