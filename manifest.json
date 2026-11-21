@@ -1,13 +1,14 @@
 {
   "id": "baidu-netdisk-sync",
   "name": "Baidu Netdisk Sync",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "minAppVersion": "1.6.6",
   "description": "Free cross-platform multi-device sync with Baidu Netdisk (iOS/Android/Desktop). 免费多端/多设备百度网盘双向同步.",
   "author": "owl234",
   "authorUrl": "https://github.com/owl234",
   "fundingUrl": {
-    "Afdian (爱发电)": "https://ifdian.net/a/owl234"
+    "Afdian (爱发电)": "https://ifdian.net/a/owl234",
+    "Ko-fi": "https://ko-fi.com/owl234"
   },
   "isDesktopOnly": false
 }

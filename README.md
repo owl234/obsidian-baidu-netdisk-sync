@@ -5,6 +5,7 @@
 [![Platforms](https://img.shields.io/badge/Platforms-iOS%20%7C%20Android%20%7C%20macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://github.com/owl234/obsidian-baidu-netdisk-sync)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Sponsor on Afdian](https://img.shields.io/badge/Sponsor-%E7%88%B1%E5%8F%91%E7%94%B5%20Afdian-946CE6?logo=lightning&logoColor=white)](https://ifdian.net/a/owl234)
+[![Sponsor on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Author-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/owl234)
 
 **A 100% free, cross-platform bi-directional synchronization plugin for Obsidian via Baidu Netdisk, seamlessly connecting your vaults across iOS, Android, macOS, Windows, and Linux.**
 
@@ -102,7 +103,8 @@ npm run build
 
 本插件坚持 **100% 免费开源（MIT 协议）**，无任何付费墙或功能限制。如果这个插件帮你在手机、平板与电脑间省去了同步烦恼，欢迎自愿请作者喝杯咖啡，助力项目长期维护与迭代：
 
-- ⚡ **[前往爱发电支持作者 (ifdian.net/a/owl234)](https://ifdian.net/a/owl234)**（支持微信 / 支付宝，可自选金额单次发电）
+- ⚡ **[爱发电 Afdian (ifdian.net/a/owl234)](https://ifdian.net/a/owl234)**（国内推荐：支持微信 / 支付宝，可自选金额单次发电）
+- ☕ **[Ko-fi (ko-fi.com/owl234)](https://ko-fi.com/owl234)**（海外推荐：支持 PayPal / 国际银行卡，0% 平台抽成）
 
 ---
 
@@ -178,7 +180,8 @@ npm run build
 
 This plugin is **100% free and open-source (MIT License)** with no paywalls or subscriptions. If it saves you time syncing across your devices, you can optionally support ongoing maintenance and development:
 
-- ⚡ **[Sponsor on Afdian (ifdian.net/a/owl234)](https://ifdian.net/a/owl234)**
+- ☕ **[Support on Ko-fi (ko-fi.com/owl234)](https://ko-fi.com/owl234)** (PayPal / Card, 0% platform fee)
+- ⚡ **[Sponsor on Afdian (ifdian.net/a/owl234)](https://ifdian.net/a/owl234)** (WeChat Pay / Alipay)
 
 ---
 
