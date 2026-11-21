@@ -23,22 +23,24 @@
 2. **📱 真正的全平台覆盖与移动端友好**
    - 完美适配 **iOS (iPhone/iPad)、Android 手机/平板、macOS、Windows 和 Linux**。
    - 彻底摆脱第三方海外 WebDAV 线路受阻、网络抖动、单月上传流量限额以及移动端 Git 操作门槛高的难题。
+   - 内置**可配置单文件体积上限（默认 100 MB）**，避免移动端同步超大附件引发 WebView 内存溢出闪退。
 3. **⚡ 独创一键跨端配置迁移 (Multi-Device Fast Pairing)**
-   - 仅需在电脑端完成一次百度网盘授权，点击即可生成受 **AES-256-GCM 密码保护的配对码**。
+   - 仅需在电脑端完成一次百度网盘授权，点击即可生成受 **AES-256-GCM 独立临时密码保护的配对码**。
    - 手机/平板端一键粘贴导入，无需在移动端重复申请开发者账号或跳转浏览器授权，秒级完成多端组网。
-4. **🔒 工业级端到端加密 (E2EE)**
-   - 具备可选的零知识加密机制（AES-256-GCM + PBKDF2）。文件在离开本地前完成加密，网盘端仅存放密文，兼顾网盘便捷性与笔记隐私安全。
+4. **🔒 高性能工业级端到端加密 (E2EE v2)**
+   - 可选零知识端到端加密（**E2EE v2**：PBKDF2-SHA256 600,000 次会话主密钥内存缓存 + 每文件独立 HKDF-SHA256 密钥 + AES-256-GCM + Header AAD 完整性认证），移动端大库批量加解密速度提升百倍，同时完全向下兼容解密历史 v1（含 10 万次迭代）密文。
+   - > ⚠️ **v1.1.0 E2EE 升级提示**：新版本写入采用 E2EE v2 格式（向下完全兼容读取 v1），如已开启端到端加密，请确保**所有同步设备均升级至 v1.1.0 及以上版本**。
 
 ---
 
 ### 🌟 核心特性
 
-- 📱 **全平台兼容 (Cross-Platform)**：纯 TypeScript + Obsidian 官方跨平台 API 打造，无 Node.js 底层依赖，桌面与移动端体验丝滑如一。
-- ⚡ **智能切片与极速秒传**：严格遵循百度 PCS 规范，大文件 4MB 动态切片断点续传；命中网盘云端指纹时瞬间完成极速秒传。
-- ⏱️ **LWW 冲突仲裁 (Last-Write-Wins)**：内置 3-Way 差异规划引擎，多设备并发编辑冲突时自动依据最新时间戳收敛一致，并保留历史安全底线。
-- 🛡️ **双向防误删保护 (Dual Trash)**：本地删除同步进入 Obsidian 知识库回收站 (`.trash`)，云端删除进入百度网盘回收站，杜绝误操作丢失资产。
-- 🧩 **选择性配置同步**：支持自由选择同步 `.obsidian/` 下的插件与主题外观，默认精准排除 `workspace*.json` 等设备专用缓存。
-- 🚀 **多样触发矩阵**：支持侧边栏图标、状态栏、快捷命令、启动自动同步、定时后台轮询以及编辑保存防抖自动同步。
+- 📱 **全平台兼容与双语自适应 (Cross-Platform & Bilingual i18n)**：纯 TypeScript + Obsidian 官方跨平台 API 打造，无 Node.js 底层依赖，插件界面自动跟随 Obsidian 系统语言切换中文 / English。
+- ⚡ **高速协议调度、真并发与极速秒传**：支持 1~5 路真并发传输、`listall` 递归拉取（带 `list` 自动降级回退）、100 条批量 `filemetas` 与批量删除、4MB 动态切片与 `content-md5`/`slice-md5` 云端秒传，同时具备 64 位 `fs_id` 精度保护与 OAuth 单飞刷新重试。
+- 🛡️ **零数据丢失冲突保护 (Conflict Copy + LWW)**：内置 3-Way 差异规划引擎与无清单明文 MD5 去重；多设备并发编辑冲突时**默认自动保留冲突副本**（`*.conflict-YYYYMMDD-HHmmss.*`）防止静默覆盖丢稿，也可按需在设置中切换为 LWW 最新时间覆盖。
+- ♻️ **双向防误删保护 (Dual Trash)**：本地删除移入 Obsidian 回收站 (`.trash`)，云端删除进入百度网盘回收站，杜绝误操作丢失资产。
+- 🧩 **精细配置同步与过滤**：自由选择同步 `.obsidian/` 下的插件、主题与 CSS 片段 (`snippets/`)，精确排除本插件敏感目录及 `workspace*.json` 设备缓存，不误伤普通笔记。
+- 🚀 **多样触发矩阵**：支持侧边栏图标、状态栏、快捷命令、启动自动同步、定时后台轮询，以及覆盖修改/创建/删除/重命名的防抖自动同步（含回写抑制防 ping-pong 循环）。
 
 ---
 
@@ -53,9 +55,9 @@
 
 #### 步骤二：一键迁移到手机 / 平板 / 第二台设备
 1. 在电脑端插件设置中，找到 **“2. 多设备快速配对与配置迁移”**；
-2. 点击 **“📤 导出配置至其他设备”**，输入临时配对密码，点击生成并复制加密配对码；
+2. 点击 **“导出配置至其他设备”**，设置独立的临时配对密码（PIN），生成并复制加密配对码；
 3. 打开手机/平板上的 Obsidian，在社区插件市场安装并启用本插件；
-4. 进入插件设置，点击 **“📥 导入外部设备配置”**，粘贴配对码并输入密码，点击应用；
+4. 进入插件设置，点击 **“导入外部设备配置”**，粘贴配对码并输入密码，点击应用；
 5. **搞定！** 移动端立即连接成功，无需在手机上重复申请应用或登录授权。
 
 ---
@@ -64,7 +66,7 @@
 
 #### 方式 1：Obsidian 官方社区插件市场（推荐）
 1. 打开 Obsidian -> **设置** -> **第三方插件** -> 关闭“受限模式”；
-2. 点击 **社区插件浏览**，在搜索栏输入 `Baidu Netdisk Sync` 或 `百度网盘`；
+2. 点击 **社区插件浏览**，在搜索栏输入 `Baidu Netdisk Sync`；
 3. 点击 **安装 (Install)**，安装完成后点击 **启用 (Enable)**。
 
 #### 方式 2：GitHub 手动安装
@@ -74,13 +76,19 @@
 
 ---
 
-### 💻 本地构建与测试
+### 💻 本地构建与校验
 
 ```bash
 # 安装依赖
 npm install
 
-# 运行全套自动化测试（包含 MD5、过滤引擎、LWW仲裁器、多设备加解密迁移）
+# TypeScript 严格类型检查
+npm run typecheck
+
+# Obsidian 官方社区插件 ESLint 规范检查
+npm run lint
+
+# 运行全套单元与端到端集成测试（MD5、i18n、过滤器、冲突副本、真并发队列、E2EE v2/v1、百度协议、同步引擎）
 npm test
 
 # 生产环境编译打包
@@ -95,26 +103,27 @@ npm run build
 
 1. **💰 100% Free, Zero Infrastructure Cost**
    - Say goodbye to expensive cloud sync subscriptions ($4–$10/month).
-   - No need to manage rented VPS servers, complex S3 bucket egress fees, or NAS port forwarding. Standard personal Baidu accounts provide massive storage (up to 2TB) at zero monetary cost.
+   - No rented VPS servers, complex S3 bucket egress fees, or NAS port forwarding. Standard personal Baidu accounts provide massive storage (up to 2TB) at zero monetary cost.
 2. **📱 True Cross-Platform, Mobile-First Design**
    - Seamlessly supports **iOS (iPhone/iPad), Android, macOS, Windows, and Linux**.
-   - No network throttling or complex mobile Git requirements. Enjoy dependable connectivity and high-speed domestic transfers.
+   - Built-in **configurable single-file size guard (default 100 MB)** protects mobile WebViews from out-of-memory crashes when vaults contain oversized media files.
 3. **⚡ One-Click Multi-Device Pairing**
-   - Authorize once on your PC, then click **Export Configuration** to generate an **AES-256-GCM encrypted pairing code**.
-   - Paste into your phone or tablet to link devices in seconds without repeated OAuth log-ins on mobile screens.
-4. **🔒 End-to-End Encryption (E2EE)**
-   - Optional client-side AES-256-GCM encryption with PBKDF2 key derivation. Your notes and attachments are encrypted before leaving your hardware.
+   - Authorize once on your PC, then click **Export configuration** to generate an **AES-256-GCM encrypted pairing code** protected by a separate temporary PIN.
+   - Paste into your phone or tablet to link devices in seconds without repeated OAuth logins on mobile screens.
+4. **🔒 High-Performance End-to-End Encryption (E2EE v2)**
+   - Optional zero-knowledge client-side encryption (**E2EE v2**: cached PBKDF2-SHA256 600k master key + per-file HKDF-SHA256 AES-256-GCM keys + authenticated 56-byte header AAD), delivering orders-of-magnitude faster mobile batch sync while remaining fully backward-compatible with legacy v1 (600k & 100k) ciphertexts.
+   - > ⚠️ **v1.1.0 E2EE upgrade note**: v1.1.0 writes E2EE v2 format (while seamlessly decrypting legacy v1 files). If E2EE is enabled, please **upgrade all synced devices to v1.1.0+** so every device can decrypt newly uploaded files.
 
 ---
 
 ### 🌟 Key Features
 
-- 📱 **Cross-Platform**: Developed strictly with pure TypeScript and Obsidian cross-platform APIs (`app.vault.adapter` and `requestUrl`), running smoothly across iOS, Android, and Desktop.
-- ⚡ **Chunked Resumable Uploads & Instant Cloud Deduplication**: Implements official Baidu PCS specifications with 4MB slicing and cloud hashing for instant transfer.
-- ⏱️ **LWW 3-Way Conflict Arbiter**: Last-Write-Wins logic resolves concurrent edits deterministically across multiple devices.
-- 🛡️ **Dual Trash Protection**: Deletions are safeguarded into Obsidian's local `.trash` and Baidu cloud's Recycle Bin.
-- 🧩 **Granular Config Sync**: Sync your plugins and CSS themes while excluding transient workspace caches.
-- 🚀 **Rich Trigger Options**: Manual icon click, status bar, quick command palette, startup auto-sync, interval polling, and debounced save sync.
+- 📱 **Cross-Platform & Auto Bilingual UI**: Pure TypeScript with Obsidian cross-platform APIs (`app.vault.adapter` & `requestUrl`), automatically adapting UI language between English and Chinese based on Obsidian's locale.
+- ⚡ **High-Speed Protocol, True Concurrency & Rapid Upload**: 1–5 concurrent transfer workers, recursive `listall` listing (with automatic `list` BFS fallback), batched `filemetas` & remote deletes (100 items/call), 4MB chunked uploads with `content-md5`/`slice-md5` rapid upload, 64-bit `fs_id` precision safety, and deduplicated OAuth refresh-and-retry.
+- 🛡️ **Zero-Data-Loss Conflict Protection**: 3-Way diff planner with manifestless plaintext MD5 deduplication. Concurrent edits **default to preserving conflict backup copies** (`*.conflict-YYYYMMDD-HHmmss.*`), with an option to switch back to Last-Write-Wins (LWW).
+- ♻️ **Dual Trash Protection**: Local deletions go to Obsidian's `.trash`; remote deletions go to Baidu Netdisk's Recycle Bin.
+- 🧩 **Granular Config Sync**: Selectively sync `.obsidian/` plugins, themes, and CSS `snippets/` while excluding workspace caches and plugin credentials.
+- 🚀 **Rich Trigger Options**: Ribbon icon, status bar, command palette, startup sync, periodic polling, and debounced save sync (covering modify, create, delete, and rename with echo suppression).
 
 ---
 
@@ -122,10 +131,10 @@ npm run build
 
 1. **Primary Device (e.g. Desktop)**:
    - Configure your personal developer AppKey/Secret and complete OAuth in plugin settings.
-   - Go to **Section 2: Multi-Device Quick Pairing**, click **Export Configuration**, set a temporary PIN, and copy the pairing code.
+   - Go to **Section 2: Multi-device quick pairing**, click **Export configuration**, set a temporary PIN, and copy the pairing code.
 2. **Secondary Device (e.g. iPhone, iPad, Android)**:
    - Install **Baidu Netdisk Sync** from the Obsidian Community Store.
-   - Open plugin settings -> click **Import Configuration**, paste the code, enter your PIN, and submit.
+   - Open plugin settings -> click **Import configuration**, paste the code, enter your PIN, and submit.
    - You're instantly connected and ready to sync across all devices!
 
 ---
@@ -141,6 +150,18 @@ npm run build
 1. Download `main.js`, `manifest.json`, and `styles.css` from [Latest Releases](https://github.com/owl234/obsidian-baidu-netdisk-sync/releases).
 2. Extract them into your vault at `.obsidian/plugins/baidu-netdisk-sync/`.
 3. Reload community plugins and enable **Baidu Netdisk Sync**.
+
+---
+
+### 💻 Local Development & Verification
+
+```bash
+npm install
+npm run typecheck
+npm run lint
+npm test
+npm run build
+```
 
 ---
 
