@@ -16,9 +16,23 @@
     "obsidian-plugin",
     "baidu-netdisk",
     "sync",
-    "cloud"
+    "cloud",
+    "e2ee",
+    "cross-platform",
+    "backup"
   ],
-  "author": "",
+  "author": {
+    "name": "OWL234",
+    "url": "https://github.com/owl234"
+  },
+  "homepage": "https://github.com/owl234/obsidian-baidu-netdisk-sync#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/owl234/obsidian-baidu-netdisk-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/owl234/obsidian-baidu-netdisk-sync/issues"
+  },
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.10.1",

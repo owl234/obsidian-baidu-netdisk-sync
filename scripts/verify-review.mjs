@@ -50,6 +50,7 @@ try {
 const PLUGIN_URL = process.env.OBS_PLUGIN_URL || 'https://community.obsidian.md/account/plugins/baidu-netdisk-sync';
 const OBS_TOKEN = process.env.OBS_TOKEN;
 const OBS_STRIPE_MID = process.env.OBS_STRIPE_MID;
+const OBS_STRIPE_SID = process.env.OBS_STRIPE_SID;
 
 // ANSI colors
 const colors = {
@@ -95,6 +96,7 @@ async function main() {
 
   const cookies = [];
   if (OBS_STRIPE_MID) cookies.push(`__stripe_mid=${OBS_STRIPE_MID}`);
+  if (OBS_STRIPE_SID) cookies.push(`__stripe_sid=${OBS_STRIPE_SID}`);
   cookies.push(`obs_token=${OBS_TOKEN}`);
 
   // If --check or --refresh flag is passed, trigger release check first
@@ -116,8 +118,8 @@ async function main() {
       },
     });
 
-    if (res.status === 401 || res.status === 403) {
-      console.error(`${colors.red}❌ Authentication Failed (HTTP ${res.status}). Your OBS_TOKEN may be invalid or expired.${colors.reset}`);
+    if (res.status === 401 || res.status === 403 || res.url.includes('/auth/login')) {
+      console.error(`${colors.red}❌ Authentication Failed (HTTP ${res.status}, final URL: ${res.url}). Your OBS_TOKEN may be invalid or expired.${colors.reset}`);
       process.exit(1);
     }
     if (!res.ok) {
@@ -351,9 +353,22 @@ async function main() {
 
   console.log('\n' + '='.repeat(65));
 
-  const hasCriticalFailure = criticalBanners.length > 0 || categories.errors.length > 0 || finalStatus === 'Failed';
+  const isTargetVersionMatched = matchedRelease && matchedRelease.label === localManifest.version;
+  const isPassingStatus = finalStatus === 'Passed' || finalStatus === 'Approved' || finalStatus === 'Completed';
+  const hasCriticalFailure =
+    criticalBanners.length > 0 ||
+    categories.errors.length > 0 ||
+    finalStatus === 'Failed' ||
+    finalStatus === 'Unknown' ||
+    !isTargetVersionMatched;
 
-  if (hasCriticalFailure) {
+  if (finalStatus === 'Pending') {
+    console.log(`${colors.yellow}⏳ Verification Pending: Automated scan for ${localManifest.version} is still running. Re-run shortly.${colors.reset}\n`);
+    process.exit(2);
+  } else if (hasCriticalFailure || !isPassingStatus) {
+    if (!isTargetVersionMatched) {
+      console.log(`${colors.red}❌ Version Mismatch: Expected release ${localManifest.version}, portal shows ${matchedRelease ? matchedRelease.label : 'None'}.${colors.reset}`);
+    }
     console.log(`${colors.red}❌ Verification Failed: Action required before community distribution can succeed.${colors.reset}\n`);
     process.exit(1);
   } else {
