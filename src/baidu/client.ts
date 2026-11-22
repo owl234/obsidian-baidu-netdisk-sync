@@ -10,6 +10,7 @@ import {
   BaiduPrecreateResponse,
   BaiduFileManagerResponse,
   DelayFn,
+  FatalApiError,
   HttpRequestFn,
   HttpRequestParam,
   HttpResponse,
@@ -43,15 +44,25 @@ class RetryableRequestError extends Error {
   }
 }
 
-function getHeaderCaseInsensitive(headers: Record<string, string> | undefined, name: string): string {
-  if (!headers) return "";
-  const lower = name.toLowerCase();
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === lower) {
-      return v;
-    }
+function getApiErrorCode(data: { errno?: number; error_code?: number }): number | null {
+  if (typeof data.errno === "number") {
+    return data.errno !== 0 ? data.errno : null;
   }
-  return "";
+  if (typeof data.error_code === "number") {
+    return data.error_code !== 0 ? data.error_code : null;
+  }
+  return null;
+}
+
+function startsWithJsonObject(buffer: ArrayBuffer): boolean {
+  const view = new Uint8Array(buffer);
+  for (let i = 0; i < view.length; i++) {
+    const b = view[i];
+    // Skip ASCII whitespace (space, tab, LF, CR)
+    if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d) continue;
+    return b === 0x7b; // '{'
+  }
+  return false;
 }
 
 function decodeSmallBufferToUtf8(buffer: ArrayBuffer): string {
@@ -66,6 +77,7 @@ export class BaiduClient {
   private delayFn: DelayFn;
   private onWarn?: (message: string) => void;
   private requestTimeoutMs: number;
+  private listallUnsupportedPaths = new Set<string>();
 
   constructor(
     private oauth: BaiduOAuthManager,
@@ -99,9 +111,9 @@ export class BaiduClient {
           "http"
         );
 
-        // HTTP 401 -> force token refresh and retry with new token
+        // HTTP 401 -> force token refresh (deduped against failedToken) and retry with new token
         if (resp.status === 401) {
-          token = await this.oauth.refreshTokenIfNeeded(true);
+          token = await this.oauth.refreshTokenIfNeeded(true, token);
           throw new RetryableRequestError("HTTP 401 Unauthorized (token refreshed)");
         }
 
@@ -123,41 +135,67 @@ export class BaiduClient {
 
             // Baidu xpan invalid token (-6) or PCS invalid/expired token (110 / 111)
             if (errno === -6 || errorCode === 110 || errorCode === 111) {
-              token = await this.oauth.refreshTokenIfNeeded(true);
+              token = await this.oauth.refreshTokenIfNeeded(true, token);
               throw new RetryableRequestError(`Token expired (${errno ?? errorCode})`);
             }
           } else {
-            // Binary download path: NEVER blindly invoke JSON.parse on file bodies.
-            // Only inspect tiny JSON error payloads with Baidu API signature.
-            const contentType = getHeaderCaseInsensitive(resp.headers, "content-type").toLowerCase();
-            if (contentType.includes("application/json") && resp.arrayBuffer.byteLength > 0 && resp.arrayBuffer.byteLength < 4096) {
+            // Binary download path: NEVER blindly invoke JSON.parse on arbitrary binary bodies.
+            // Inspect any tiny `{...}` payload (even under application/octet-stream) for Baidu API
+            // error envelopes so HTTP 200 error JSON (e.g. expired dlink 31360) never overwrites files.
+            if (
+              resp.arrayBuffer.byteLength > 0 &&
+              resp.arrayBuffer.byteLength < 4096 &&
+              startsWithJsonObject(resp.arrayBuffer)
+            ) {
               const snippet = decodeSmallBufferToUtf8(resp.arrayBuffer);
               try {
                 const maybeErr = JSON.parse(snippet) as {
                   errno?: number;
                   error_code?: number;
                   error_msg?: string;
+                  errmsg?: string;
+                  show_msg?: string;
                   request_id?: unknown;
                 };
                 const hasBaiduErrorSignature =
                   maybeErr !== null &&
                   typeof maybeErr === "object" &&
-                  ("request_id" in maybeErr || ("error_code" in maybeErr && "error_msg" in maybeErr));
+                  !Array.isArray(maybeErr) &&
+                  ("request_id" in maybeErr ||
+                    ("error_code" in maybeErr && "error_msg" in maybeErr) ||
+                    ("errno" in maybeErr && ("errmsg" in maybeErr || "show_msg" in maybeErr)));
 
                 if (hasBaiduErrorSignature) {
-                  if (maybeErr.errno === 31034 || maybeErr.error_code === 31034 || maybeErr.error_code === 31326) {
-                    throw new RetryableRequestError(`Baidu Download Rate Limit (${maybeErr.errno ?? maybeErr.error_code})`);
+                  const code =
+                    typeof maybeErr.error_code === "number"
+                      ? maybeErr.error_code
+                      : typeof maybeErr.errno === "number"
+                        ? maybeErr.errno
+                        : 0;
+                  if (code === 31034 || code === 31326) {
+                    throw new RetryableRequestError(`Baidu Download Rate Limit (${code})`);
                   }
-                  if (maybeErr.errno === -6 || maybeErr.error_code === 110 || maybeErr.error_code === 111) {
-                    token = await this.oauth.refreshTokenIfNeeded(true);
-                    throw new RetryableRequestError(`Download Token Expired (${maybeErr.errno ?? maybeErr.error_code})`);
+                  if (code === -6 || code === 110 || code === 111) {
+                    token = await this.oauth.refreshTokenIfNeeded(true, token);
+                    throw new RetryableRequestError(`Download Token Expired (${code})`);
+                  }
+                  if (code !== 0) {
+                    throw new FatalApiError(
+                      t("client.downloadApiError", {
+                        code,
+                        detail: sanitizeErrorMessage(
+                          maybeErr.error_msg || maybeErr.errmsg || maybeErr.show_msg || snippet
+                        )
+                      }),
+                      code
+                    );
                   }
                 }
               } catch (e: unknown) {
-                if (e instanceof RetryableRequestError) {
+                if (e instanceof RetryableRequestError || e instanceof FatalApiError) {
                   throw e;
                 }
-                // Legitimate JSON file downloaded by user; return as-is
+                // Legitimate JSON/text file downloaded by user; return as-is
               }
             }
           }
@@ -168,7 +206,7 @@ export class BaiduClient {
         lastError = err;
         const isRetryable =
           err instanceof RetryableRequestError ||
-          !(err instanceof Error && err.name === "SyntaxError");
+          (!(err instanceof FatalApiError) && !(err instanceof Error && err.name === "SyntaxError"));
 
         if (attempt < maxRetries && isRetryable) {
           const jitter = Math.random() * 300;
@@ -181,6 +219,9 @@ export class BaiduClient {
     }
 
     const rawMsg = lastError instanceof Error ? lastError.message : String(lastError);
+    if (lastError instanceof FatalApiError) {
+      throw new FatalApiError(sanitizeErrorMessage(rawMsg), lastError.code);
+    }
     throw new Error(sanitizeErrorMessage(rawMsg));
   }
 
@@ -203,6 +244,10 @@ export class BaiduClient {
   }
 
   private async tryListAllRecursive(cleanPath: string): Promise<BaiduFileItem[] | null> {
+    if (this.listallUnsupportedPaths.has(cleanPath)) {
+      return null;
+    }
+
     const allFiles: BaiduFileItem[] = [];
     const seenFsIds = new Set<string>();
     let cursor = 0;
@@ -226,13 +271,15 @@ export class BaiduClient {
       }
 
       const data = parseJsonPreserveIds<BaiduListResponse>(resp.text);
-      // Path does not exist / uninitialized
-      if (data.errno === -9 || data.errno === 31066 || data.errno === 20020) {
-        return [];
-      }
-
-      if (data.errno !== 0 && data.errno !== undefined) {
-        this.onWarn?.(t("engine.listallFallback", { errno: data.errno }));
+      // NEVER treat errno 20020 ("path outside allowed scope"), gateway error_code, or any
+      // non-zero/malformed listall response as an empty remote directory. Fall back to BFS.
+      const apiErr = getApiErrorCode(data);
+      if (apiErr !== null || (data.errno === undefined && !Array.isArray(data.list))) {
+        const errCode = apiErr ?? "missing_errno";
+        if (apiErr === 20020) {
+          this.listallUnsupportedPaths.add(cleanPath);
+        }
+        this.onWarn?.(t("engine.listallFallback", { errno: errCode }));
         return null;
       }
 
@@ -247,13 +294,14 @@ export class BaiduClient {
         }
       }
 
-      if (data.has_more === 1 && data.cursor !== undefined) {
-        const nextCursor = Number(data.cursor);
+      if (data.has_more === 1) {
+        const nextCursor = data.cursor !== undefined ? Number(data.cursor) : Number.NaN;
+        // Never silently truncate paginated results; fall back to BFS if cursor stops advancing.
         if (!Number.isFinite(nextCursor) || nextCursor <= currentCursor) {
-          hasMore = false;
-        } else {
-          cursor = nextCursor;
+          this.onWarn?.(t("engine.listallFallback", { errno: "invalid_cursor" }));
+          return null;
         }
+        cursor = nextCursor;
       } else {
         hasMore = false;
       }
@@ -265,6 +313,7 @@ export class BaiduClient {
   private async listAllByBfs(cleanPath: string): Promise<BaiduFileItem[]> {
     const allFiles: BaiduFileItem[] = [];
     const seenFsIds = new Set<string>();
+    const visitedDirs = new Set<string>([cleanPath]);
     const dirQueue: string[] = [cleanPath];
 
     while (dirQueue.length > 0) {
@@ -289,19 +338,25 @@ export class BaiduClient {
         }
 
         const data = parseJsonPreserveIds<BaiduListResponse>(resp.text);
-        if (data.errno === -9 || data.errno === 31066 || data.errno === 20020) {
-          hasMore = false;
-          break;
+        // Only treat -9 / 31066 ("directory not found") as an uninitialized empty vault on the
+        // very first page of the root path. Never swallow 20020, gateway error_code, or
+        // mid-traversal/mid-pagination errors, which would otherwise produce a truncated listing.
+        if ((data.errno === -9 || data.errno === 31066) && currentDir === cleanPath && currentStart === 0) {
+          return [];
         }
 
-        if (data.errno !== 0 && data.errno !== undefined) {
-          throw new Error(t("client.listApiError", { errno: data.errno }));
+        const apiErr = getApiErrorCode(data);
+        if (apiErr !== null || (data.errno === undefined && !Array.isArray(data.list))) {
+          throw new Error(t("client.listApiError", { errno: apiErr ?? "missing_errno" }));
         }
 
         if (data.list && Array.isArray(data.list)) {
           for (const item of data.list) {
             if (item.isdir === 1) {
-              dirQueue.push(item.path);
+              if (!visitedDirs.has(item.path)) {
+                visitedDirs.add(item.path);
+                dirQueue.push(item.path);
+              }
             } else {
               const idKey = String(item.fs_id);
               if (!seenFsIds.has(idKey)) {
@@ -352,6 +407,10 @@ export class BaiduClient {
       }
 
       const data = parseJsonPreserveIds<BaiduFileMetasResponse>(resp.text);
+      const apiErr = getApiErrorCode(data);
+      if (apiErr !== null || (data.errno === undefined && !Array.isArray(data.list))) {
+        throw new Error(t("client.metaApiError", { errno: apiErr ?? "missing_errno" }));
+      }
       if (data.list && Array.isArray(data.list)) {
         for (const meta of data.list) {
           result.set(String(meta.fs_id), meta);
@@ -386,7 +445,7 @@ export class BaiduClient {
     );
 
     if (resp.status !== 200) {
-      throw new Error(t("client.downloadHttpError", { status: resp.status }));
+      throw new FatalApiError(t("client.downloadHttpError", { status: resp.status }), resp.status);
     }
 
     return resp.arrayBuffer;
@@ -438,10 +497,11 @@ export class BaiduClient {
     }
 
     const data = parseJsonPreserveIds<BaiduPrecreateResponse>(resp.text);
-    if (data.errno !== 0) {
+    const apiErr = getApiErrorCode(data);
+    if (apiErr !== null || data.errno !== 0) {
       throw new Error(
         t("client.precreateApiError", {
-          errno: data.errno,
+          errno: apiErr ?? String(data.errno ?? "missing_errno"),
           detail: sanitizeErrorMessage(resp.text || "")
         })
       );
@@ -533,10 +593,11 @@ export class BaiduClient {
     }
 
     const data = parseJsonPreserveIds<BaiduCreateResponse>(resp.text);
-    if (data.errno !== 0) {
+    const apiErr = getApiErrorCode(data);
+    if (apiErr !== null || data.errno !== 0) {
       throw new Error(
         t("client.createApiError", {
-          errno: data.errno,
+          errno: apiErr ?? String(data.errno ?? "missing_errno"),
           detail: sanitizeErrorMessage(resp.text || "")
         })
       );
@@ -603,13 +664,39 @@ export class BaiduClient {
       }
 
       const data = parseJsonPreserveIds<BaiduFileManagerResponse>(resp.text);
-      if (data.errno !== 0) {
+      const apiErr = getApiErrorCode(data);
+      if (data.errno === 12 && Array.isArray(data.info)) {
+        // errno 12 indicates partial batch failure; ignore already-missing paths (-9 / 31066)
+        const fatalItems = data.info.filter(
+          (item) => item.errno !== 0 && item.errno !== -9 && item.errno !== 31066
+        );
+        if (fatalItems.length > 0) {
+          throw new Error(
+            t("client.deleteApiError", {
+              errno: data.errno,
+              detail: sanitizeErrorMessage(JSON.stringify(fatalItems))
+            })
+          );
+        }
+      } else if (apiErr !== null || data.errno !== 0) {
         throw new Error(
           t("client.deleteApiError", {
-            errno: data.errno,
+            errno: apiErr ?? String(data.errno ?? "missing_errno"),
             detail: sanitizeErrorMessage(resp.text || "")
           })
         );
+      } else if (Array.isArray(data.info)) {
+        const fatalItems = data.info.filter(
+          (item) => item.errno !== 0 && item.errno !== -9 && item.errno !== 31066
+        );
+        if (fatalItems.length > 0) {
+          throw new Error(
+            t("client.deleteApiError", {
+              errno: fatalItems[0].errno,
+              detail: sanitizeErrorMessage(JSON.stringify(fatalItems))
+            })
+          );
+        }
       }
     }
   }

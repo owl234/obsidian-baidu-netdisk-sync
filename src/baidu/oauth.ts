@@ -2,6 +2,7 @@ import { BaiduSyncSettings } from "../settings/settings";
 import {
   BaiduTokenResponse,
   BaiduUserInfoResponse,
+  FatalApiError,
   HttpRequestFn,
   parseJsonPreserveIds,
   sanitizeErrorMessage
@@ -81,10 +82,16 @@ export class BaiduOAuthManager {
     return tokenData;
   }
 
-  async refreshTokenIfNeeded(force = false): Promise<string> {
+  async refreshTokenIfNeeded(force = false, failedToken?: string): Promise<string> {
     const settings = this.getSettings();
     if (!settings.refreshToken) {
-      throw new Error(t("oauth.missingRefreshToken"));
+      throw new FatalApiError(t("oauth.missingRefreshToken"));
+    }
+
+    // If a concurrent worker already rotated the access token after our request started
+    // with `failedToken`, reuse the fresh token immediately instead of triggering a refresh storm.
+    if (force && failedToken && settings.accessToken && settings.accessToken !== failedToken) {
+      return settings.accessToken;
     }
 
     // Refresh 1 day before expiration
@@ -134,17 +141,20 @@ export class BaiduOAuthManager {
       });
 
       if (resp.status !== 200) {
-        throw new Error(
-          t("oauth.tokenRefreshHttpError", {
-            status: resp.status,
-            detail: sanitizeErrorMessage(resp.text || "")
-          })
-        );
+        const errMsg = t("oauth.tokenRefreshHttpError", {
+          status: resp.status,
+          detail: sanitizeErrorMessage(resp.text || "")
+        });
+        // 4xx from OAuth token endpoint (invalid_grant / revoked refresh_token) is non-retryable
+        if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+          throw new FatalApiError(errMsg, resp.status);
+        }
+        throw new Error(errMsg);
       }
 
       const tokenData = parseJsonPreserveIds<BaiduTokenResponse>(resp.text);
       if (tokenData.error) {
-        throw new Error(
+        throw new FatalApiError(
           t("oauth.tokenRefreshApiError", {
             error: tokenData.error,
             detail: tokenData.error_description || t("oauth.unknownError")
@@ -164,6 +174,9 @@ export class BaiduOAuthManager {
     } catch (err: unknown) {
       const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
       console.error("[BaiduSync] Token refresh failed:", msg);
+      if (err instanceof FatalApiError) {
+        throw new FatalApiError(msg, err.code);
+      }
       throw new Error(msg);
     }
   }

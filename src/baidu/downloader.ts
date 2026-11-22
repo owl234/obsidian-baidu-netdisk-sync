@@ -5,6 +5,7 @@ import { t } from "../i18n";
 
 export interface DownloadOptions {
   e2eePassword?: string;
+  expectedSize?: number;
   onProgress?: (receivedBytes: number, totalBytes: number) => void;
 }
 
@@ -20,6 +21,21 @@ export class BaiduDownloader {
     }
 
     const rawBuffer = await this.client.downloadFile(meta.dlink);
+
+    const expectedSize =
+      options.expectedSize !== undefined
+        ? options.expectedSize
+        : typeof meta.size === "number" && meta.size >= 0
+          ? meta.size
+          : undefined;
+    if (expectedSize !== undefined && rawBuffer.byteLength !== expectedSize) {
+      throw new Error(
+        t("client.downloadSizeMismatch", {
+          expected: expectedSize,
+          actual: rawBuffer.byteLength
+        })
+      );
+    }
 
     // Check if file is encrypted with E2EE (supports v1 and v2)
     if (isEncrypted(rawBuffer)) {

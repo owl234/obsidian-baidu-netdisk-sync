@@ -82,19 +82,38 @@ export class DecryptMigrationModal extends Modal {
               );
 
               if (result.success) {
+                const hasSkipped = result.skipped > 0;
+                const hasLocalIgnores = Boolean(this.plugin.settings.localIgnoredPatterns?.trim());
                 this.plugin.settings.enableE2EE = false;
-                if (this.clearPasswordOnFinish) {
+                if (this.clearPasswordOnFinish && !hasSkipped && !hasLocalIgnores) {
                   this.plugin.settings.e2eePassword = "";
                   clearKeyCache();
                 }
                 await this.plugin.saveSettings();
 
-                if (this.statusTextEl) {
-                  this.statusTextEl.setText(
-                    t("modal.migration.successStatus", { total: result.total })
-                  );
+                if (hasSkipped) {
+                  const msg = t("modal.migration.successWithSkippedStatus", {
+                    total: result.total,
+                    skipped: result.skipped
+                  });
+                  if (this.statusTextEl) {
+                    this.statusTextEl.setText(msg);
+                  }
+                  new Notice(msg, 10000);
+                } else if (this.clearPasswordOnFinish && hasLocalIgnores) {
+                  const msg = t("modal.migration.successWithIgnoredPwdKept");
+                  if (this.statusTextEl) {
+                    this.statusTextEl.setText(msg);
+                  }
+                  new Notice(msg, 10000);
+                } else {
+                  if (this.statusTextEl) {
+                    this.statusTextEl.setText(
+                      t("modal.migration.successStatus", { total: result.total })
+                    );
+                  }
+                  new Notice(t("modal.migration.successNotice"));
                 }
-                new Notice(t("modal.migration.successNotice"));
                 this.onComplete?.();
               } else {
                 if (this.statusTextEl) {

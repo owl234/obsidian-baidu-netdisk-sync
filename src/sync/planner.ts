@@ -100,7 +100,8 @@ export class SyncPlanner {
       ...Object.keys(manifestFiles)
     ]);
 
-    const normalizeRemoteBase = remoteBasePath.replace(/\/+$/, "");
+    const rawBase = remoteBasePath.trim().replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/+$/, "");
+    const normalizeRemoteBase = rawBase && !rawBase.startsWith("/") ? `/${rawBase}` : rawBase;
 
     for (const path of allPaths) {
       const local = localFiles.get(path);
@@ -162,9 +163,14 @@ export class SyncPlanner {
           Math.abs(local.mtime - manifest.mtime) > 1000 || local.size !== manifest.size;
         const expectedRemoteSize =
           manifest.remoteSize !== undefined ? manifest.remoteSize : manifest.size;
+        const fsIdChanged =
+          Boolean(manifest.fsId) &&
+          Boolean(remote.fsId) &&
+          String(remote.fsId) !== String(manifest.fsId);
         const remoteChanged =
           Math.abs(remote.mtime - manifest.remoteMtime) > 1000 ||
-          remote.size !== expectedRemoteSize;
+          remote.size !== expectedRemoteSize ||
+          fsIdChanged;
 
         if (!localChanged && !remoteChanged) {
           continue;
@@ -291,9 +297,14 @@ export class SyncPlanner {
           // Local was deleted
           const expectedRemoteSize =
             manifest.remoteSize !== undefined ? manifest.remoteSize : manifest.size;
+          const fsIdChanged =
+            Boolean(manifest.fsId) &&
+            Boolean(remote.fsId) &&
+            String(remote.fsId) !== String(manifest.fsId);
           const remoteChanged =
             Math.abs(remote.mtime - manifest.remoteMtime) > 1000 ||
-            remote.size !== expectedRemoteSize;
+            remote.size !== expectedRemoteSize ||
+            fsIdChanged;
           if (remoteChanged) {
             plans.push({
               path,

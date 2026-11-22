@@ -40,8 +40,22 @@ export interface BaiduFileItem {
   md5?: string;
 }
 
+export class FatalApiError extends Error {
+  constructor(
+    message: string,
+    public readonly code?: number
+  ) {
+    super(message);
+    this.name = "FatalApiError";
+  }
+}
+
 export interface BaiduListResponse {
-  errno: number;
+  errno?: number;
+  error_code?: number;
+  error_msg?: string;
+  errmsg?: string;
+  show_msg?: string;
   guid_info?: string;
   list?: BaiduFileItem[];
   has_more?: number;
@@ -55,13 +69,16 @@ export interface BaiduPrecreateInfo {
   size: number;
   ctime?: number;
   mtime?: number;
+  server_mtime?: number;
   isdir?: number;
   category?: number;
   server_filename?: string;
 }
 
 export interface BaiduPrecreateResponse {
-  errno: number;
+  errno?: number;
+  error_code?: number;
+  error_msg?: string;
   path: string;
   uploadid: string;
   /**
@@ -75,7 +92,9 @@ export interface BaiduPrecreateResponse {
 }
 
 export interface BaiduCreateResponse {
-  errno: number;
+  errno?: number;
+  error_code?: number;
+  error_msg?: string;
   fs_id: string | number;
   md5: string;
   server_filename: string;
@@ -99,12 +118,16 @@ export interface BaiduFileMeta {
 }
 
 export interface BaiduFileMetasResponse {
-  errno: number;
+  errno?: number;
+  error_code?: number;
+  error_msg?: string;
   list: BaiduFileMeta[];
 }
 
 export interface BaiduFileManagerResponse {
-  errno: number;
+  errno?: number;
+  error_code?: number;
+  error_msg?: string;
   info?: Array<{ errno: number; path: string }>;
   taskid?: number;
 }

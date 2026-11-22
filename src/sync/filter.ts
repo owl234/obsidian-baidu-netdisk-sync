@@ -38,7 +38,11 @@ export function globToRegex(glob: string): RegExp {
 }
 
 function normalizePath(p: string): string {
-  return p.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+  return p.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "").normalize("NFC");
+}
+
+export function normalizeCanonicalPath(p: string): string {
+  return normalizePath(p);
 }
 
 function isUnderDir(normalized: string, dir: string): boolean {
@@ -46,8 +50,19 @@ function isUnderDir(normalized: string, dir: string): boolean {
   return normalized === dir || normalized.startsWith(`${dir}/`);
 }
 
+interface CompiledIgnoreRule {
+  regex: RegExp;
+  dirOnly: boolean;
+  /**
+   * When a glob ends with `/**` (e.g. `**\/attachments/**`), `dirPruneRegex` matches
+   * the directory prefix itself (`**\/attachments`) so local scan can prune the folder
+   * without descending while remaining 100% symmetric with remote file-level matching.
+   */
+  dirPruneRegex?: RegExp;
+}
+
 export class SyncFilter {
-  private compiledPatterns: RegExp[] = [];
+  private compiledRules: CompiledIgnoreRule[] = [];
   private cleanConfigDir: string;
   private cleanPluginDirs: string[];
 
@@ -75,22 +90,53 @@ export class SyncFilter {
   }
 
   private recompilePatterns(): void {
-    this.compiledPatterns = [];
+    this.compiledRules = [];
     const combined = `${this.settings.ignoredPatterns || ""}\n${this.settings.localIgnoredPatterns || ""}`;
     const lines = combined.split("\n");
     for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith("#")) {
-        try {
-          this.compiledPatterns.push(globToRegex(trimmed));
-        } catch {
-          // ignore invalid patterns
+      const trimmed = line.trim().replace(/\\/g, "/").replace(/^\/+/, "").normalize("NFC");
+      if (!trimmed || trimmed.startsWith("#")) {
+        continue;
+      }
+
+      try {
+        if (trimmed.endsWith("/")) {
+          const stripped = trimmed.replace(/\/+$/, "");
+          if (stripped) {
+            this.compiledRules.push({
+              regex: globToRegex(stripped),
+              dirOnly: true
+            });
+          }
+        } else if (trimmed.endsWith("/**")) {
+          const prefix = trimmed.slice(0, -3).replace(/\/+$/, "");
+          this.compiledRules.push({
+            regex: globToRegex(trimmed),
+            dirOnly: false,
+            dirPruneRegex: prefix ? globToRegex(prefix) : undefined
+          });
+        } else {
+          this.compiledRules.push({
+            regex: globToRegex(trimmed),
+            dirOnly: false
+          });
         }
+      } catch {
+        // ignore invalid patterns
       }
     }
   }
 
-  shouldIgnore(relativePath: string): boolean {
+  /**
+   * Determines whether a relative vault/remote path should be excluded from sync.
+   *
+   * Uses .gitignore-style ancestor inheritance: if any strict ancestor directory matches
+   * an ignore rule (whether `Private`, `Private/`, `**\/temp`, or `**\/attachments/**`),
+   * all descendant files are guaranteed to be ignored as well. This guarantees exact
+   * mathematical symmetry between local folder pruning (`isDir = true`) and remote
+   * file-level filtering (`isDir = false`).
+   */
+  shouldIgnore(relativePath: string, isDir = false): boolean {
     const normalized = normalizePath(relativePath);
     if (!normalized) {
       return false;
@@ -111,7 +157,12 @@ export class SyncFilter {
     ) {
       return true;
     }
-    if (normalized === "sync_manifest.json" || normalized.endsWith("/sync_manifest.json")) {
+    if (
+      normalized === "sync_manifest.json" ||
+      normalized.endsWith("/sync_manifest.json") ||
+      normalized === "sync_manifest.json.bak" ||
+      normalized.endsWith("/sync_manifest.json.bak")
+    ) {
       return true;
     }
 
@@ -166,10 +217,30 @@ export class SyncFilter {
       }
     }
 
-    // Check user-configured glob patterns
-    for (const pattern of this.compiledPatterns) {
-      if (pattern.test(normalized)) {
-        return true;
+    // Precompute strict ancestor directory prefixes once for ancestor inheritance
+    const ancestors: string[] = [];
+    let slashIdx = normalized.indexOf("/");
+    while (slashIdx !== -1) {
+      ancestors.push(normalized.slice(0, slashIdx));
+      slashIdx = normalized.indexOf("/", slashIdx + 1);
+    }
+
+    // Check user-configured rules with full ancestor inheritance
+    for (const rule of this.compiledRules) {
+      if (isDir) {
+        if (rule.regex.test(normalized) || (rule.dirPruneRegex && rule.dirPruneRegex.test(normalized))) {
+          return true;
+        }
+      } else {
+        if (!rule.dirOnly && rule.regex.test(normalized)) {
+          return true;
+        }
+      }
+
+      for (const ancestor of ancestors) {
+        if (rule.regex.test(ancestor) || (rule.dirPruneRegex && rule.dirPruneRegex.test(ancestor))) {
+          return true;
+        }
       }
     }
 

@@ -1,11 +1,21 @@
-import { App, Modal, Setting, ButtonComponent } from "obsidian";
+import { App, Modal, Setting, ButtonComponent, Notice } from "obsidian";
 import { SyncEngine, SyncLogEntry, SyncState } from "../sync/engine";
 import { t } from "../i18n";
 
+const CONFIRM_ARM_TIMEOUT_MS = 8000;
+
 export class SyncLogModal extends Modal {
   private logContainerEl: HTMLElement | null = null;
+  private recoveryContainerEl: HTMLElement | null = null;
   private statusDescEl: HTMLElement | null = null;
   private syncBtn: ButtonComponent | null = null;
+  private forceDeleteBtn: ButtonComponent | null = null;
+  private resetBaselineBtn: ButtonComponent | null = null;
+  private forceDeleteArmed = false;
+  private resetBaselineArmed = false;
+  private forceDeleteTimer: number | null = null;
+  private resetBaselineTimer: number | null = null;
+  private lastRecoverySignature = "";
   private unsubscribeLog?: () => void;
   private unsubscribeState?: () => void;
 
@@ -40,6 +50,9 @@ export class SyncLogModal extends Modal {
 
     this.statusDescEl = syncSetting.descEl;
 
+    this.recoveryContainerEl = contentEl.createDiv({ cls: "baidu-sync-recovery-section" });
+    this.renderRecoveryControls();
+
     // Immediately reflect live engine state if modal is opened mid-sync
     this.applyState(this.engine.getState(), this.engine.getLastStatusMessage());
 
@@ -55,8 +68,124 @@ export class SyncLogModal extends Modal {
 
     // Subscribe to state changes
     this.unsubscribeState = this.engine.onStateChange((state: SyncState, message?: string) => {
+      this.renderRecoveryControls();
       this.applyState(state, message);
     });
+  }
+
+  private clearArmTimers(): void {
+    if (this.forceDeleteTimer !== null) {
+      window.clearTimeout(this.forceDeleteTimer);
+      this.forceDeleteTimer = null;
+    }
+    if (this.resetBaselineTimer !== null) {
+      window.clearTimeout(this.resetBaselineTimer);
+      this.resetBaselineTimer = null;
+    }
+    this.forceDeleteArmed = false;
+    this.resetBaselineArmed = false;
+  }
+
+  private renderRecoveryControls(force = false): void {
+    const container = this.recoveryContainerEl;
+    if (!container) return;
+
+    const showForceDelete = this.engine.wasLastRunMassDeleteAborted();
+    const showCorruptedHighlight = this.engine.wasLastRunManifestCorrupted();
+    const signature = `${showForceDelete}:${showCorruptedHighlight}`;
+    if (!force && signature === this.lastRecoverySignature) {
+      return;
+    }
+    this.lastRecoverySignature = signature;
+
+    this.clearArmTimers();
+    this.forceDeleteBtn = null;
+    this.resetBaselineBtn = null;
+    container.empty();
+
+    const isActive = this.engine.isSyncing();
+
+    if (showForceDelete || showCorruptedHighlight) {
+      container.addClass("baidu-sync-warning-box");
+    } else {
+      container.removeClass("baidu-sync-warning-box");
+    }
+
+    if (showForceDelete) {
+      new Setting(container)
+        .setName(t("modal.log.forceDeleteName"))
+        .setDesc(t("modal.log.forceDeleteDesc"))
+        .addButton((btn) => {
+          this.forceDeleteBtn = btn;
+          btn.buttonEl.addClass("mod-warning");
+          btn
+            .setButtonText(t("modal.log.forceDeleteBtn"))
+            .setDisabled(isActive)
+            .onClick(async () => {
+              if (!this.forceDeleteArmed) {
+                this.forceDeleteArmed = true;
+                btn.setButtonText(t("modal.log.forceDeleteConfirmBtn"));
+                this.forceDeleteTimer = window.setTimeout(() => {
+                  this.forceDeleteArmed = false;
+                  this.forceDeleteTimer = null;
+                  if (this.forceDeleteBtn) {
+                    this.forceDeleteBtn.setButtonText(t("modal.log.forceDeleteBtn"));
+                  }
+                }, CONFIRM_ARM_TIMEOUT_MS);
+                return;
+              }
+
+              this.clearArmTimers();
+              btn.setDisabled(true);
+              btn.setButtonText(t("modal.log.syncingBtn"));
+              try {
+                await this.engine.startSync(false, { bypassMassDeleteGuard: true });
+              } finally {
+                this.renderRecoveryControls(true);
+                this.applyState(this.engine.getState(), this.engine.getLastStatusMessage());
+              }
+            });
+        });
+    }
+
+    new Setting(container)
+      .setName(t("modal.log.resetBaselineName"))
+      .setDesc(t("modal.log.resetBaselineDesc"))
+      .addButton((btn) => {
+        this.resetBaselineBtn = btn;
+        btn
+          .setButtonText(t("modal.log.resetBaselineBtn"))
+          .setDisabled(isActive)
+          .onClick(async () => {
+            if (!this.resetBaselineArmed) {
+              this.resetBaselineArmed = true;
+              btn.setButtonText(t("modal.log.resetBaselineConfirmBtn"));
+              btn.buttonEl.addClass("mod-warning");
+              this.resetBaselineTimer = window.setTimeout(() => {
+                this.resetBaselineArmed = false;
+                this.resetBaselineTimer = null;
+                if (this.resetBaselineBtn) {
+                  this.resetBaselineBtn.setButtonText(t("modal.log.resetBaselineBtn"));
+                  this.resetBaselineBtn.buttonEl.removeClass("mod-warning");
+                }
+              }, CONFIRM_ARM_TIMEOUT_MS);
+              return;
+            }
+
+            this.clearArmTimers();
+            btn.setDisabled(true);
+            try {
+              await this.engine.resetLocalBaseline();
+              new Notice(t("modal.log.resetBaselineSuccess"));
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : String(err);
+              new Notice(t("modal.log.resetBaselineFailed", { msg }));
+            } finally {
+              this.renderRecoveryControls(true);
+              this.applyState(this.engine.getState(), this.engine.getLastStatusMessage());
+            }
+          });
+      });
   }
 
   private applyState(state: SyncState, message?: string): void {
@@ -65,6 +194,12 @@ export class SyncLogModal extends Modal {
     if (this.syncBtn) {
       this.syncBtn.setDisabled(isActive);
       this.syncBtn.setButtonText(isActive ? t("modal.log.syncingBtn") : t("modal.log.syncBtn"));
+    }
+    if (this.forceDeleteBtn) {
+      this.forceDeleteBtn.setDisabled(isActive);
+    }
+    if (this.resetBaselineBtn) {
+      this.resetBaselineBtn.setDisabled(isActive);
     }
 
     if (this.statusDescEl) {
@@ -130,13 +265,18 @@ export class SyncLogModal extends Modal {
   }
 
   onClose(): void {
+    this.clearArmTimers();
     this.unsubscribeLog?.();
     this.unsubscribeState?.();
     this.unsubscribeLog = undefined;
     this.unsubscribeState = undefined;
     this.logContainerEl = null;
+    this.recoveryContainerEl = null;
     this.statusDescEl = null;
     this.syncBtn = null;
+    this.forceDeleteBtn = null;
+    this.resetBaselineBtn = null;
+    this.lastRecoverySignature = "";
 
     const { contentEl } = this;
     contentEl.empty();

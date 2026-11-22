@@ -1,4 +1,4 @@
-import { Plugin, Notice, TAbstractFile, TFile, moment, requestUrl } from "obsidian";
+import { Plugin, Notice, Platform, TAbstractFile, TFile, moment, requestUrl } from "obsidian";
 import { BaiduSyncSettings, DEFAULT_SETTINGS } from "./settings/settings";
 import { BaiduSyncSettingTab } from "./settings/settingsTab";
 import { BaiduOAuthManager } from "./baidu/oauth";
@@ -78,17 +78,22 @@ export default class BaiduSyncPlugin extends Plugin {
           size: s.size
         };
       },
-      statFast: async (path: string) => {
-        const abstractFile = this.app.vault.getAbstractFileByPath(path);
-        if (abstractFile && abstractFile instanceof TFile && abstractFile.stat) {
-          return {
-            type: "file",
-            mtime: abstractFile.stat.mtime,
-            size: abstractFile.stat.size
-          };
-        }
-        return vaultBridge.stat(path);
-      },
+      // Use zero-IPC in-memory TFile.stat ONLY on Mobile (iOS/Android Capacitor bridge deadlock prevention).
+      // On Desktop, adapter.stat() is a fast native fs.stat syscall and guarantees immediate visibility
+      // of external edits (VS Code, Git, CLI scripts) before Obsidian's watcher refreshes TFile.stat.
+      statFast: Platform.isMobile
+        ? async (path: string) => {
+            const abstractFile = this.app.vault.getAbstractFileByPath(path);
+            if (abstractFile && abstractFile instanceof TFile && abstractFile.stat) {
+              return {
+                type: "file",
+                mtime: abstractFile.stat.mtime,
+                size: abstractFile.stat.size
+              };
+            }
+            return vaultBridge.stat(path);
+          }
+        : undefined,
       list: (dir: string) => this.app.vault.adapter.list(dir),
       mkdir: (path: string) => this.app.vault.adapter.mkdir(path),
       readBinary: (path: string) => this.app.vault.adapter.readBinary(path),
@@ -133,7 +138,7 @@ export default class BaiduSyncPlugin extends Plugin {
       const res = await this.engine.startSync(false);
       if (res.success) {
         new Notice(t("notice.syncSuccess"));
-      } else if (!res.bridgeDead) {
+      } else if (!res.bridgeDead && !res.massDeleteAborted && !res.manifestCorrupted) {
         new Notice(t("notice.syncFailed"));
       }
     });
@@ -147,7 +152,13 @@ export default class BaiduSyncPlugin extends Plugin {
         }
       }
 
-      if (state === "error" && message === t("engine.bridgeDeadlock")) {
+      if (
+        state === "error" &&
+        message &&
+        (message === t("engine.bridgeDeadlock") ||
+          this.engine.wasLastRunMassDeleteAborted() ||
+          this.engine.wasLastRunManifestCorrupted())
+      ) {
         new Notice(message, 12000);
       }
 
@@ -163,7 +174,12 @@ export default class BaiduSyncPlugin extends Plugin {
       name: t("command.syncNow"),
       callback: async () => {
         new Notice(t("notice.syncStarting"));
-        await this.engine.startSync(false);
+        const res = await this.engine.startSync(false);
+        if (res.success) {
+          new Notice(t("notice.syncSuccess"));
+        } else if (!res.bridgeDead && !res.massDeleteAborted && !res.manifestCorrupted) {
+          new Notice(t("notice.syncFailed"));
+        }
       }
     });
 
@@ -183,6 +199,7 @@ export default class BaiduSyncPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.engine?.abortActiveSync();
     if (this.intervalId !== null) {
       window.clearInterval(this.intervalId);
       this.intervalId = null;
@@ -259,7 +276,8 @@ export default class BaiduSyncPlugin extends Plugin {
     // 3. Save / Create / Delete / Rename debounced trigger with echo suppression
     const onVaultChange = (file: TAbstractFile) => {
       if (!this.settings.syncOnSave || !this.settings.accessToken) return;
-      if (file.path.endsWith("sync_manifest.json") || file.path.includes("workspace")) return;
+      if (file.path.endsWith("sync_manifest.json") || file.path.endsWith("sync_manifest.json.bak")) return;
+      if (this.engine.shouldIgnore(file.path)) return;
       if (this.engine.wasRecentlyWrittenBySync(file.path)) return;
 
       if (this.engine.isSyncing()) {

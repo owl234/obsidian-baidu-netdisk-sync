@@ -12,7 +12,7 @@ import { SyncPlanner, LocalFileInfo, RemoteFileInfo, buildConflictPath } from ".
 import { SyncFilter, globToRegex } from "../src/sync/filter";
 import { AsyncQueue, QueueCancelledError } from "../src/sync/queue";
 import { ManifestManager, ManifestStorageAdapter } from "../src/sync/manifest";
-import { SyncEngine, VaultSyncBridge } from "../src/sync/engine";
+import { SyncEngine, VaultSyncBridge, normalizeAndValidateRemoteBasePath } from "../src/sync/engine";
 import { OperationTimeoutError } from "../src/sync/timeout";
 import { BaiduSyncSettings, DEFAULT_SETTINGS } from "../src/settings/settings";
 import { exportEncryptedConfig, importEncryptedConfig } from "../src/crypto/configShare";
@@ -1133,6 +1133,1318 @@ async function testBridgeDeadlockCheckpointsAndFastScan() {
   console.log("   Issue #1 deadlock protection, checkpoint & fast-scan tests passed!");
 }
 
+async function testDataLossProtectionSuite() {
+  console.log("-> Testing P0/P1 data-loss protections (errno 20020 fallback, cursor truncation, BFS errors, download JSON guard, mass-delete circuit breaker, remoteBasePath switch, manifest corruption, E2EE empty pwd, TOCTOU delete)...");
+
+  const makeSettings = (overrides: Partial<BaiduSyncSettings> = {}): BaiduSyncSettings => ({
+    ...DEFAULT_SETTINGS,
+    appKey: "k",
+    appSecret: "s",
+    accessToken: "VALID_TOK",
+    refreshToken: "REF",
+    tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    syncObsidianConfig: false,
+    ...overrides
+  });
+
+  // 1. listall errno 20020 MUST fall back to BFS (NOT return []) and cache unsupported path
+  {
+    let settings = makeSettings();
+    let listallCalls = 0;
+    let bfsCalls = 0;
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        listallCalls++;
+        return makeJsonResponse({ errno: 20020, show_msg: "该路径不在允许的访问范围内" });
+      }
+      if (param.url.includes("method=list&")) {
+        bfsCalls++;
+        return makeJsonResponse({
+          errno: 0,
+          list: [
+            {
+              fs_id: "10001",
+              path: "/apps/obsidian_vault/resume.md",
+              server_filename: "resume.md",
+              size: 120,
+              isdir: 0,
+              server_mtime: 1700000000,
+              server_ctime: 1700000000,
+              md5: "abc"
+            }
+          ]
+        });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+
+    const first = await client.listAll("/apps/obsidian_vault");
+    assert.strictEqual(first.length, 1, "errno 20020 from listall must fall back to BFS and return files");
+    assert.strictEqual(first[0].path, "/apps/obsidian_vault/resume.md");
+    assert.strictEqual(listallCalls, 1);
+    assert.strictEqual(bfsCalls, 1);
+
+    // Second call on same path must skip listall directly
+    const second = await client.listAll("/apps/obsidian_vault");
+    assert.strictEqual(second.length, 1);
+    assert.strictEqual(listallCalls, 1, "Unsupported listall path should be cached for the session");
+    assert.strictEqual(bfsCalls, 2);
+  }
+
+  // 2. listall stuck/invalid pagination cursor MUST fall back to BFS instead of returning partial list
+  {
+    let settings = makeSettings();
+    let bfsUsed = false;
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({
+          errno: 0,
+          has_more: 1,
+          cursor: 0, // stuck cursor!
+          list: [{ fs_id: "1", path: "/apps/obsidian_vault/p1.md", server_filename: "p1.md", size: 5, isdir: 0, server_mtime: 1, server_ctime: 1 }]
+        });
+      }
+      if (param.url.includes("method=list&")) {
+        bfsUsed = true;
+        return makeJsonResponse({
+          errno: 0,
+          list: [
+            { fs_id: "1", path: "/apps/obsidian_vault/p1.md", server_filename: "p1.md", size: 5, isdir: 0, server_mtime: 1, server_ctime: 1 },
+            { fs_id: "2", path: "/apps/obsidian_vault/p2.md", server_filename: "p2.md", size: 5, isdir: 0, server_mtime: 1, server_ctime: 1 }
+          ]
+        });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+    const items = await client.listAll("/apps/obsidian_vault");
+    assert.strictEqual(bfsUsed, true, "Stuck listall cursor must fall back to BFS");
+    assert.strictEqual(items.length, 2, "BFS fallback must recover complete listing");
+  }
+
+  // 3. listAllByBfs errno 20020 & subdir -9 MUST throw; root -9 returns []
+  {
+    let settings = makeSettings();
+    let mode: "20020" | "root-9" | "subdir-9" = "20020";
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({ errno: 2 });
+      }
+      if (param.url.includes("method=list&")) {
+        if (mode === "20020") {
+          return makeJsonResponse({ errno: 20020, show_msg: "denied" });
+        }
+        if (mode === "root-9") {
+          return makeJsonResponse({ errno: -9 });
+        }
+        if (param.url.includes("subdir")) {
+          return makeJsonResponse({ errno: -9 });
+        }
+        return makeJsonResponse({
+          errno: 0,
+          list: [{ fs_id: "99", path: "/apps/obsidian_vault/subdir", server_filename: "subdir", size: 0, isdir: 1, server_mtime: 1, server_ctime: 1 }]
+        });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+
+    await assert.rejects(() => client.listAll("/apps/forbidden"), /20020/, "BFS errno 20020 must throw");
+    mode = "root-9";
+    assert.deepStrictEqual(await client.listAll("/apps/new_empty"), [], "Root -9 is empty uninitialized dir");
+    mode = "subdir-9";
+    await assert.rejects(() => client.listAll("/apps/obsidian_vault"), /-9/, "Subdir -9 mid-BFS must throw to avoid partial listing");
+  }
+
+  // 4. Binary download HTTP 200 JSON Baidu error MUST throw; user JSON files MUST pass through
+  {
+    let settings = makeSettings();
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.startsWith("https://d.pcs.baidu.com/expired")) {
+        return makeJsonResponse({ error_code: 31360, error_msg: "url expired", request_id: 987654 });
+      }
+      if (param.url.startsWith("https://d.pcs.baidu.com/userjson")) {
+        return makeJsonResponse({ theme: "Minimal", showRibbon: true });
+      }
+      if (param.url.includes("method=filemetas")) {
+        return makeJsonResponse({ errno: 2 });
+      }
+      if (param.url.includes("opera=delete")) {
+        const body = String(param.body || "");
+        if (body.includes("already_gone")) {
+          return makeJsonResponse({ errno: 12, info: [{ errno: -9, path: "/apps/obsidian_vault/already_gone.md" }] });
+        }
+        return makeJsonResponse({ errno: 12, info: [{ errno: 20020, path: "/apps/obsidian_vault/forbidden.md" }] });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+
+    await assert.rejects(
+      () => client.downloadFile("https://d.pcs.baidu.com/expired"),
+      /31360/,
+      "HTTP 200 Baidu JSON error envelope must be rejected instead of overwriting user file"
+    );
+    const okJsonBuf = await client.downloadFile("https://d.pcs.baidu.com/userjson");
+    assert.deepStrictEqual(JSON.parse(new TextDecoder().decode(okJsonBuf)), { theme: "Minimal", showRibbon: true });
+    await assert.rejects(() => client.getFileMetas(["123"]), /2/, "getFileMetas must throw on non-zero errno");
+    await client.deleteFiles(["/apps/obsidian_vault/already_gone.md"]);
+    await assert.rejects(() => client.deleteFiles(["/apps/obsidian_vault/forbidden.md"]), /12|20020/);
+  }
+
+  // 5. E2EE enabled with empty password MUST refuse plaintext upload
+  {
+    let settings = makeSettings();
+    const mockHttp: HttpRequestFn = async () => {
+      throw new Error("HTTP must not be invoked when E2EE password is missing");
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+    const uploader = new BaiduUploader(client);
+    await assert.rejects(
+      () => uploader.uploadFile("/apps/obsidian_vault/secret.md", new ArrayBuffer(8), { enableE2EE: true, e2eePassword: "" }),
+      /password|密码/i,
+      "Uploader must refuse plaintext upload when enableE2EE is true with blank password"
+    );
+  }
+
+  // 6. ManifestManager.load() must throw on corrupted JSON instead of silently wiping baseline
+  {
+    const vault = createMemoryVault(".obsidian");
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    vault.seedFile(manifestPath, "{corrupted-json");
+    const mgr = new ManifestManager(vault, manifestPath);
+    await assert.rejects(() => mgr.load(), /corrupted|损坏/i, "Corrupted manifest must abort instead of resetting empty");
+  }
+
+  // 7. Bidirectional mass-deletion circuit breaker (both local wipe & remote wipe blocked!)
+  {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+
+    // 7a. Remote returns empty while 6 files exist locally & in manifest -> MUST abort local wipe
+    const localVault = createMemoryVault(".obsidian");
+    const localManifest = new ManifestManager(localVault, manifestPath);
+    localManifest.setRemoteBasePath("/apps/obsidian_vault");
+    for (let i = 1; i <= 6; i++) {
+      const p = `note${i}.md`;
+      localVault.seedFile(p, `hello ${i}`, nowSec * 1000);
+      localManifest.set({
+        path: p,
+        remotePath: `/apps/obsidian_vault/${p}`,
+        mtime: nowSec * 1000,
+        remoteMtime: nowSec * 1000,
+        md5: "m",
+        size: 7,
+        remoteSize: 7,
+        fsId: String(100 + i)
+      });
+    }
+    await localManifest.save();
+
+    let settings = makeSettings();
+    const emptyRemoteHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) return makeJsonResponse({ errno: 0, has_more: 0, list: [] });
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauthA = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, emptyRemoteHttp);
+    const engineA = new SyncEngine(
+      localVault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauthA, emptyRemoteHttp, { delayFn: zeroDelay }),
+      localManifest,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const resA = await engineA.startSync(false);
+    assert.strictEqual(resA.success, false);
+    assert.strictEqual(resA.massDeleteAborted, true, "Empty remote must trip local wipe circuit breaker");
+    assert.strictEqual(localVault.trashed.length, 0, "Zero local files may be trashed when circuit breaker trips");
+    assert.strictEqual(localVault.files.has("note1.md"), true);
+
+    // 7b. Local returns empty while 6 files exist remotely & in manifest -> MUST abort remote wipe
+    const emptyLocalVault = createMemoryVault(".obsidian");
+    const remoteManifest = new ManifestManager(emptyLocalVault, manifestPath);
+    remoteManifest.setRemoteBasePath("/apps/obsidian_vault");
+    const remoteList = [];
+    for (let i = 1; i <= 6; i++) {
+      const p = `note${i}.md`;
+      remoteManifest.set({
+        path: p,
+        remotePath: `/apps/obsidian_vault/${p}`,
+        mtime: nowSec * 1000,
+        remoteMtime: nowSec * 1000,
+        md5: "m",
+        size: 7,
+        remoteSize: 7,
+        fsId: String(200 + i)
+      });
+      remoteList.push({
+        fs_id: String(200 + i),
+        path: `/apps/obsidian_vault/${p}`,
+        server_filename: p,
+        size: 7,
+        isdir: 0,
+        server_mtime: nowSec,
+        server_ctime: nowSec,
+        md5: "m"
+      });
+    }
+    await remoteManifest.save();
+
+    let remoteDeleteCalled = false;
+    const populatedRemoteHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) return makeJsonResponse({ errno: 0, has_more: 0, list: remoteList });
+      if (param.url.includes("opera=delete")) {
+        remoteDeleteCalled = true;
+        return makeJsonResponse({ errno: 0 });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauthB = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, populatedRemoteHttp);
+    const engineB = new SyncEngine(
+      emptyLocalVault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauthB, populatedRemoteHttp, { delayFn: zeroDelay }),
+      remoteManifest,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const resB = await engineB.startSync(false);
+    assert.strictEqual(resB.success, false);
+    assert.strictEqual(resB.massDeleteAborted, true, "Empty local vault must trip remote wipe circuit breaker");
+    assert.strictEqual(remoteDeleteCalled, false, "Zero remote deletes may execute when circuit breaker trips");
+  }
+
+  // 8. Switching remoteBasePath resets stale manifest instead of wiping local vault
+  {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    const vault = createMemoryVault(".obsidian");
+    const manifestMgr = new ManifestManager(vault, manifestPath);
+    for (let i = 1; i <= 3; i++) {
+      const p = `doc${i}.md`;
+      vault.seedFile(p, `doc-${i}`, nowSec * 1000);
+      manifestMgr.set({
+        path: p,
+        remotePath: `/apps/old_vault/${p}`,
+        mtime: nowSec * 1000,
+        remoteMtime: nowSec * 1000,
+        md5: "m",
+        size: 5,
+        remoteSize: 5,
+        fsId: String(300 + i)
+      });
+    }
+    await manifestMgr.save();
+
+    let settings = makeSettings({ remoteBasePath: "/apps/new_vault" });
+    const uploaded: string[] = [];
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) return makeJsonResponse({ errno: 0, has_more: 0, list: [] });
+      if (param.url.includes("method=precreate")) {
+        const params = new URLSearchParams(String(param.body || ""));
+        const p = params.get("path") || "";
+        uploaded.push(p);
+        return makeJsonResponse({
+          errno: 0,
+          return_type: 2,
+          uploadid: "",
+          block_list: [],
+          info: { fs_id: "777", path: p, size: Number(params.get("size") || 0), mtime: nowSec, md5: "x" }
+        });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const engine = new SyncEngine(
+      vault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay }),
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(vault.trashed.length, 0, "Changing remoteBasePath must never delete local files");
+    assert.strictEqual(uploaded.length, 3, "Local files must upload to new remoteBasePath");
+    assert.ok(uploaded.every((p) => p.startsWith("/apps/new_vault/")));
+  }
+
+  // 9. DELETE_LOCAL TOCTOU protection: file edited during remote scan must NOT be trashed
+  {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    const vault = createMemoryVault(".obsidian");
+    vault.seedFile("active.md", "old", nowSec * 1000);
+    const manifestMgr = new ManifestManager(vault, manifestPath);
+    manifestMgr.setRemoteBasePath("/apps/obsidian_vault");
+    manifestMgr.set({
+      path: "active.md",
+      remotePath: "/apps/obsidian_vault/active.md",
+      mtime: nowSec * 1000,
+      remoteMtime: nowSec * 1000,
+      md5: "old",
+      size: 3,
+      remoteSize: 3,
+      fsId: "401"
+    });
+    await manifestMgr.save();
+
+    let settings = makeSettings();
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        // User edits active.md right while remote scan is in flight!
+        vault.seedFile("active.md", "freshly edited content", (nowSec + 60) * 1000);
+        return makeJsonResponse({ errno: 0, has_more: 0, list: [] });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const engine = new SyncEngine(
+      vault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay }),
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(vault.trashed.length, 0, "Modified file must not be trashed by stale DELETE_LOCAL plan");
+    assert.strictEqual(vault.readText("active.md"), "freshly edited content");
+    assert.ok(manifestMgr.get("active.md"), "Manifest entry should stay so next sync re-uploads modified file");
+  }
+
+  console.log("   All P0/P1 data-loss protection tests passed!");
+}
+
+async function testDeepAuditProtectionsSuite() {
+  console.log(
+    "-> Testing deep-audit P0/P1 protections (SyncFilter symmetry, gateway error_code, download size/octet-stream/dlink refresh, OAuth refresh storm/fatal, DOWNLOAD/CONFLICT/DELETE_REMOTE TOCTOU, case-rename race, case collision, NFC/NFD, remoteBasePath guardrails, settings snapshot, statFast reverify, manifest .bak/save errors)..."
+  );
+
+  const makeSettings = (overrides: Partial<BaiduSyncSettings> = {}): BaiduSyncSettings => ({
+    ...DEFAULT_SETTINGS,
+    appKey: "k",
+    appSecret: "s",
+    accessToken: "VALID_TOK",
+    refreshToken: "REF",
+    tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    syncObsidianConfig: false,
+    ...overrides
+  });
+
+  // 1. SyncFilter .gitignore ancestor inheritance & trailing slash symmetry (prevents remote folder wipe!)
+  {
+    const f = new SyncFilter(
+      {
+        ...DEFAULT_SETTINGS,
+        ignoredPatterns: "Private\nExports/\n**/temp\n*.tmp",
+        localIgnoredPatterns: "**/attachments/**"
+      },
+      ".obsidian"
+    );
+
+    // Every directory ignored during local pruning MUST also ignore every child file during remote scan!
+    assert.strictEqual(f.shouldIgnore("Private", true), true);
+    assert.strictEqual(f.shouldIgnore("Private/secret.md", false), true);
+    assert.strictEqual(f.shouldIgnore("Private/sub/deep.md", false), true);
+
+    // Trailing slash matches directory and its children, NOT a root file literally named "Exports"
+    assert.strictEqual(f.shouldIgnore("Exports", true), true);
+    assert.strictEqual(f.shouldIgnore("Exports/report.pdf", false), true);
+    assert.strictEqual(f.shouldIgnore("Exports", false), false);
+
+    // Nested folder rule without /** and wildcard folder name
+    assert.strictEqual(f.shouldIgnore("work/temp", true), true);
+    assert.strictEqual(f.shouldIgnore("work/temp/draft.md", false), true);
+    assert.strictEqual(f.shouldIgnore("bak.tmp", true), true);
+    assert.strictEqual(f.shouldIgnore("bak.tmp/data.md", false), true);
+
+    // **/attachments/** prunes directory immediately AND ignores children
+    assert.strictEqual(f.shouldIgnore("attachments", true), true);
+    assert.strictEqual(f.shouldIgnore("attachments/pic.png", false), true);
+    assert.strictEqual(f.shouldIgnore("sync_manifest.json.bak", false), true);
+
+    // End-to-end: adding `Private` (without /**) MUST NOT delete remote Private/secret.md!
+    const nowSec = Math.floor(Date.now() / 1000);
+    const vault = createMemoryVault(".obsidian");
+    vault.seedFile("Private/secret.md", "top secret", nowSec * 1000);
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    const manifestMgr = new ManifestManager(vault, manifestPath);
+    manifestMgr.setRemoteBasePath("/apps/obsidian_vault");
+    manifestMgr.set({
+      path: "Private/secret.md",
+      remotePath: "/apps/obsidian_vault/Private/secret.md",
+      mtime: nowSec * 1000,
+      remoteMtime: nowSec * 1000,
+      md5: "s",
+      size: 10,
+      remoteSize: 10,
+      fsId: "901"
+    });
+    await manifestMgr.save();
+
+    let remoteDeleteCalled = false;
+    let settings = makeSettings({ ignoredPatterns: "Private" });
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({
+          errno: 0,
+          has_more: 0,
+          list: [
+            {
+              fs_id: "901",
+              path: "/apps/obsidian_vault/Private/secret.md",
+              server_filename: "secret.md",
+              size: 10,
+              isdir: 0,
+              server_mtime: nowSec,
+              server_ctime: nowSec,
+              md5: "s"
+            }
+          ]
+        });
+      }
+      if (param.url.includes("opera=delete")) {
+        remoteDeleteCalled = true;
+        return makeJsonResponse({ errno: 0 });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const engine = new SyncEngine(
+      vault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay }),
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(remoteDeleteCalled, false, "Folder-name ignore rule without /** MUST NEVER delete remote files");
+    assert.strictEqual(vault.readText("Private/secret.md"), "top secret");
+  }
+
+  // 2. Baidu gateway error_code-only JSON (no errno field) MUST throw instead of returning []
+  {
+    let settings = makeSettings();
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall") || param.url.includes("method=list&") || param.url.includes("method=filemetas")) {
+        return makeJsonResponse({ error_code: 31024, error_msg: "no permission", request_id: 12345 });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+    await assert.rejects(() => client.listAll("/apps/obsidian_vault"), /31024/, "Gateway error_code must throw, never return []");
+    await assert.rejects(() => client.getFileMetas(["1"]), /31024/, "filemetas gateway error_code must throw");
+  }
+
+  // 3. Download integrity: octet-stream JSON error, truncated/HTML size mismatch, and expired dlink auto-refresh
+  {
+    let settings = makeSettings();
+    const expiredBytes = new TextEncoder().encode(
+      JSON.stringify({ error_code: 31360, error_msg: "dlink expired", request_id: 42 })
+    ).slice().buffer;
+    const htmlWafBytes = new TextEncoder().encode("<html><body>Captive Portal</body></html>").slice().buffer;
+    const goodBytes = new TextEncoder().encode("hello valid note!").slice().buffer; // 17 bytes
+
+    let filemetasCalls = 0;
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.startsWith("https://d.pcs.baidu.com/octet-err")) {
+        return makeBinaryResponse(expiredBytes, "application/octet-stream");
+      }
+      if (param.url.startsWith("https://d.pcs.baidu.com/waf")) {
+        return makeBinaryResponse(htmlWafBytes, "text/html");
+      }
+      if (param.url.startsWith("https://d.pcs.baidu.com/fresh-ok")) {
+        return makeBinaryResponse(goodBytes, "application/octet-stream");
+      }
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({
+          errno: 0,
+          has_more: 0,
+          list: [
+            {
+              fs_id: "801",
+              path: "/apps/obsidian_vault/refreshed.md",
+              server_filename: "refreshed.md",
+              size: goodBytes.byteLength,
+              isdir: 0,
+              server_mtime: Math.floor(Date.now() / 1000),
+              server_ctime: Math.floor(Date.now() / 1000),
+              md5: md5(goodBytes)
+            }
+          ]
+        });
+      }
+      if (param.url.includes("method=filemetas")) {
+        filemetasCalls++;
+        const dlink = filemetasCalls === 1 ? "https://d.pcs.baidu.com/octet-err" : "https://d.pcs.baidu.com/fresh-ok";
+        return makeJsonResponse({
+          errno: 0,
+          list: [
+            {
+              fs_id: "801",
+              path: "/apps/obsidian_vault/refreshed.md",
+              server_filename: "refreshed.md",
+              size: goodBytes.byteLength,
+              isdir: 0,
+              category: 6,
+              md5: md5(goodBytes),
+              dlink
+            }
+          ]
+        });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+    const downloader = new BaiduDownloader(client);
+
+    await assert.rejects(
+      () => client.downloadFile("https://d.pcs.baidu.com/octet-err"),
+      /31360/,
+      "JSON error under application/octet-stream must still be caught"
+    );
+    await assert.rejects(
+      () =>
+        downloader.downloadWithMeta(
+          {
+            fs_id: "801",
+            path: "/apps/obsidian_vault/refreshed.md",
+            server_filename: "refreshed.md",
+            size: goodBytes.byteLength,
+            isdir: 0,
+            category: 6,
+            md5: md5(goodBytes),
+            dlink: "https://d.pcs.baidu.com/waf"
+          },
+          { expectedSize: goodBytes.byteLength }
+        ),
+      /mismatch|校验失败/i,
+      "HTML/truncated response with mismatched byte length must be rejected"
+    );
+
+    // End-to-end: prefetched dlink returns 31360 -> engine automatically re-fetches fresh dlink & succeeds!
+    const vault = createMemoryVault(".obsidian");
+    const manifestMgr = new ManifestManager(vault, ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json");
+    const engine = new SyncEngine(
+      vault,
+      () => settings,
+      async (s) => { settings = s; },
+      client,
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, true, "Expired prefetched dlink should auto-refresh and succeed");
+    assert.strictEqual(filemetasCalls, 2, "Should refresh filemetas once on 31360");
+    assert.strictEqual(vault.readText("refreshed.md"), "hello valid note!");
+  }
+
+  // 4. OAuth failedToken dedupe (no refresh storm) & revoked refresh_token fails fast without retries
+  {
+    let settings = makeSettings({ accessToken: "TOKEN_V2" });
+    let refreshCalls = 0;
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("oauth/2.0/token")) {
+        refreshCalls++;
+        return makeJsonResponse({ error: "invalid_grant", error_description: "revoked" }, 400);
+      }
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({ errno: -6 });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    // Worker had stale TOKEN_V1, but settings already holds TOKEN_V2 -> must return TOKEN_V2 with 0 HTTP calls!
+    const reused = await oauth.refreshTokenIfNeeded(true, "TOKEN_V1");
+    assert.strictEqual(reused, "TOKEN_V2");
+    assert.strictEqual(refreshCalls, 0, "Stale failedToken must reuse already-refreshed accessToken");
+
+    // Now force refresh on current token with revoked grant -> BaiduClient must fail fast (1 refresh call, NOT 4 retries!)
+    const client = new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay });
+    await assert.rejects(() => client.listAll("/apps/obsidian_vault"), /invalid_grant|400/);
+    assert.strictEqual(refreshCalls, 1, "Fatal OAuth 400 invalid_grant must not be retried");
+  }
+
+  // 5. TOCTOU protection for DOWNLOAD (edited & newly created local), CONFLICT (winner=local), DELETE_REMOTE (restored local)
+  {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const vault = createMemoryVault(".obsidian");
+    vault.seedFile("edit_during_dl.md", "v1-local", nowSec * 1000);
+    const manifestMgr = new ManifestManager(vault, ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json");
+    manifestMgr.setRemoteBasePath("/apps/obsidian_vault");
+    manifestMgr.set({
+      path: "edit_during_dl.md",
+      remotePath: "/apps/obsidian_vault/edit_during_dl.md",
+      mtime: nowSec * 1000,
+      remoteMtime: nowSec * 1000,
+      md5: "old",
+      size: 8,
+      remoteSize: 8,
+      fsId: "601"
+    });
+    manifestMgr.set({
+      path: "restored_local.md",
+      remotePath: "/apps/obsidian_vault/restored_local.md",
+      mtime: nowSec * 1000,
+      remoteMtime: nowSec * 1000,
+      md5: "old",
+      size: 4,
+      remoteSize: 4,
+      fsId: "603"
+    });
+    await manifestMgr.save();
+
+    let settings = makeSettings();
+    const remoteNewContent = new TextEncoder().encode("remote-update-v2").slice().buffer;
+    const brandNewRemote = new TextEncoder().encode("remote-brand-new").slice().buffer;
+    let deletedRemotePaths: string[] = [];
+
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        // User restores restored_local.md during remote scan!
+        vault.seedFile("restored_local.md", "back alive", (nowSec + 10) * 1000);
+        return makeJsonResponse({
+          errno: 0,
+          has_more: 0,
+          list: [
+            {
+              fs_id: "601",
+              path: "/apps/obsidian_vault/edit_during_dl.md",
+              server_filename: "edit_during_dl.md",
+              size: remoteNewContent.byteLength,
+              isdir: 0,
+              server_mtime: nowSec + 20,
+              server_ctime: nowSec,
+              md5: md5(remoteNewContent)
+            },
+            {
+              fs_id: "602",
+              path: "/apps/obsidian_vault/created_during_dl.md",
+              server_filename: "created_during_dl.md",
+              size: brandNewRemote.byteLength,
+              isdir: 0,
+              server_mtime: nowSec + 20,
+              server_ctime: nowSec,
+              md5: md5(brandNewRemote)
+            },
+            {
+              fs_id: "603",
+              path: "/apps/obsidian_vault/restored_local.md",
+              server_filename: "restored_local.md",
+              size: 4,
+              isdir: 0,
+              server_mtime: nowSec,
+              server_ctime: nowSec,
+              md5: "old"
+            }
+          ]
+        });
+      }
+      if (param.url.includes("method=filemetas")) {
+        return makeJsonResponse({
+          errno: 0,
+          list: [
+            {
+              fs_id: "601",
+              path: "/apps/obsidian_vault/edit_during_dl.md",
+              server_filename: "edit_during_dl.md",
+              size: remoteNewContent.byteLength,
+              isdir: 0,
+              category: 6,
+              md5: md5(remoteNewContent),
+              dlink: "https://d.pcs.baidu.com/dl601"
+            },
+            {
+              fs_id: "602",
+              path: "/apps/obsidian_vault/created_during_dl.md",
+              server_filename: "created_during_dl.md",
+              size: brandNewRemote.byteLength,
+              isdir: 0,
+              category: 6,
+              md5: md5(brandNewRemote),
+              dlink: "https://d.pcs.baidu.com/dl602"
+            }
+          ]
+        });
+      }
+      if (param.url.startsWith("https://d.pcs.baidu.com/dl601")) {
+        // User edits edit_during_dl.md while download is in flight!
+        vault.seedFile("edit_during_dl.md", "user fresh typing!", (nowSec + 60) * 1000);
+        return makeBinaryResponse(remoteNewContent);
+      }
+      if (param.url.startsWith("https://d.pcs.baidu.com/dl602")) {
+        // User creates created_during_dl.md locally while download is in flight!
+        vault.seedFile("created_during_dl.md", "user new note", (nowSec + 60) * 1000);
+        return makeBinaryResponse(brandNewRemote);
+      }
+      if (param.url.includes("opera=delete")) {
+        const params = new URLSearchParams(String(param.body || ""));
+        deletedRemotePaths = JSON.parse(params.get("filelist") || "[]") as string[];
+        return makeJsonResponse({ errno: 0 });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const engine = new SyncEngine(
+      vault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay }),
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(vault.readText("edit_during_dl.md"), "user fresh typing!", "DOWNLOAD must not overwrite mid-sync local edits");
+    assert.strictEqual(vault.readText("created_during_dl.md"), "user new note", "DOWNLOAD must not overwrite mid-sync newly created local file");
+    assert.strictEqual(deletedRemotePaths.length, 0, "DELETE_REMOTE must skip file restored locally during remote scan");
+    assert.strictEqual(res.stats.skipped, 3);
+  }
+
+  // 6. Case-only rename (Note.md -> note.md) on case-insensitive OS MUST NOT delete newly downloaded note.md!
+  {
+    const nowSec = Math.floor(Date.now() / 1000);
+    // Simulate a macOS/Windows/iOS case-insensitive filesystem!
+    const ciFiles = new Map<string, { actualPath: string; data: ArrayBuffer; mtime: number }>();
+    const folders = new Set<string>([""]);
+    const ciVault: VaultSyncBridge & ManifestStorageAdapter = {
+      configDir: ".obsidian",
+      async exists(p: string) {
+        return ciFiles.has(p.toLowerCase()) || folders.has(p.toLowerCase());
+      },
+      async stat(p: string) {
+        const f = ciFiles.get(p.toLowerCase());
+        if (f) return { type: "file", mtime: f.mtime, size: f.data.byteLength };
+        if (folders.has(p.toLowerCase())) return { type: "folder", mtime: 0, size: 0 };
+        return null;
+      },
+      async list(dir: string) {
+        if (dir !== "") return { files: [], folders: [] };
+        return {
+          files: Array.from(ciFiles.values())
+            .map((v) => v.actualPath)
+            .filter((p) => !p.includes("/")),
+          folders: []
+        };
+      },
+      async mkdir(p: string) {
+        folders.add(p.toLowerCase());
+      },
+      async readBinary(p: string) {
+        const f = ciFiles.get(p.toLowerCase());
+        if (!f) throw new Error(`Missing ${p}`);
+        return f.data.slice(0);
+      },
+      async writeBinary(p: string, data: ArrayBuffer) {
+        ciFiles.set(p.toLowerCase(), { actualPath: p, data: data.slice(0), mtime: Date.now() });
+      },
+      async read(p: string) {
+        const f = ciFiles.get(p.toLowerCase());
+        if (!f) throw new Error(`Missing ${p}`);
+        return new TextDecoder().decode(f.data);
+      },
+      async write(p: string, data: string) {
+        const buf = new TextEncoder().encode(data).slice().buffer;
+        ciFiles.set(p.toLowerCase(), { actualPath: p, data: buf, mtime: Date.now() });
+      },
+      async trashFile(p: string) {
+        // Deliberately slow trashFile to expose concurrency race if DELETE_LOCAL ran parallel to DOWNLOAD!
+        await new Promise((r) => setTimeout(r, 30));
+        ciFiles.delete(p.toLowerCase());
+      }
+    };
+
+    const origBytes = new TextEncoder().encode("renamed body").slice().buffer;
+    ciFiles.set("note.md", { actualPath: "Note.md", data: origBytes, mtime: nowSec * 1000 });
+    const manifestMgr = new ManifestManager(ciVault, ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json");
+    manifestMgr.setRemoteBasePath("/apps/obsidian_vault");
+    manifestMgr.set({
+      path: "Note.md",
+      remotePath: "/apps/obsidian_vault/Note.md",
+      mtime: nowSec * 1000,
+      remoteMtime: nowSec * 1000,
+      md5: md5(origBytes),
+      size: origBytes.byteLength,
+      remoteSize: origBytes.byteLength,
+      fsId: "700"
+    });
+    await manifestMgr.save();
+
+    let settings = makeSettings({ concurrency: 3 });
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({
+          errno: 0,
+          has_more: 0,
+          list: [
+            {
+              fs_id: "701",
+              path: "/apps/obsidian_vault/note.md",
+              server_filename: "note.md",
+              size: origBytes.byteLength,
+              isdir: 0,
+              server_mtime: nowSec + 5,
+              server_ctime: nowSec + 5,
+              md5: md5(origBytes)
+            }
+          ]
+        });
+      }
+      if (param.url.includes("method=filemetas")) {
+        return makeJsonResponse({
+          errno: 0,
+          list: [
+            {
+              fs_id: "701",
+              path: "/apps/obsidian_vault/note.md",
+              server_filename: "note.md",
+              size: origBytes.byteLength,
+              isdir: 0,
+              category: 6,
+              md5: md5(origBytes),
+              dlink: "https://d.pcs.baidu.com/ci701"
+            }
+          ]
+        });
+      }
+      if (param.url.startsWith("https://d.pcs.baidu.com/ci701")) {
+        return makeBinaryResponse(origBytes);
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const engine = new SyncEngine(
+      ciVault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay }),
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, true);
+    const survived = ciFiles.get("note.md");
+    assert.ok(survived, "note.md MUST survive case-only rename on case-insensitive OS!");
+    assert.strictEqual(survived!.actualPath, "note.md");
+    assert.strictEqual(new TextDecoder().decode(survived!.data), "renamed body");
+  }
+
+  // 7. Remote case-collision detection & Unicode NFD/NFC matching
+  {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const vault = createMemoryVault(".obsidian");
+    const nfdName = "cafe\u0301.md";
+    const nfcName = "caf\u00e9.md";
+    const cafeContent = "espresso";
+    vault.seedFile(nfdName, cafeContent, nowSec * 1000);
+
+    const manifestMgr = new ManifestManager(vault, ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json");
+    let settings = makeSettings();
+    let uploadCalls = 0;
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({
+          errno: 0,
+          has_more: 0,
+          list: [
+            {
+              fs_id: "910",
+              path: `/apps/obsidian_vault/${nfcName}`,
+              server_filename: nfcName,
+              size: cafeContent.length,
+              isdir: 0,
+              server_mtime: nowSec,
+              server_ctime: nowSec,
+              md5: md5(new TextEncoder().encode(cafeContent))
+            },
+            // Case-colliding pair on remote!
+            {
+              fs_id: "911",
+              path: "/apps/obsidian_vault/Dup.md",
+              server_filename: "Dup.md",
+              size: 4,
+              isdir: 0,
+              server_mtime: nowSec,
+              server_ctime: nowSec,
+              md5: "aaaa"
+            },
+            {
+              fs_id: "912",
+              path: "/apps/obsidian_vault/dup.md",
+              server_filename: "dup.md",
+              size: 4,
+              isdir: 0,
+              server_mtime: nowSec,
+              server_ctime: nowSec,
+              md5: "bbbb"
+            }
+          ]
+        });
+      }
+      if (param.url.includes("method=precreate")) {
+        uploadCalls++;
+        throw new Error("Should not upload NFD/NFC identical file");
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const engine = new SyncEngine(
+      vault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay }),
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, false, "Case collision must count as error");
+    assert.strictEqual(res.stats.errors, 1);
+    assert.strictEqual(uploadCalls, 0, "NFD local and NFC remote identical file must match without re-uploading");
+    assert.strictEqual(vault.files.has("Dup.md"), false, "Colliding remote files must not be downloaded");
+    assert.strictEqual(vault.files.has("dup.md"), false, "Colliding remote files must not be downloaded");
+    assert.ok(manifestMgr.get(nfcName), "Manifest should record canonical NFC key for matched NFD/NFC file");
+  }
+
+  // 8. remoteBasePath guardrails, missing leading '/', parent-dir switch on legacy manifest, and settings snapshot isolation
+  {
+    assert.ok(normalizeAndValidateRemoteBasePath("").error);
+    assert.ok(normalizeAndValidateRemoteBasePath("   ").error);
+    assert.ok(normalizeAndValidateRemoteBasePath("/").error);
+    assert.ok(normalizeAndValidateRemoteBasePath("/apps/../etc").error);
+    assert.strictEqual(normalizeAndValidateRemoteBasePath("apps/vault/").normalized, "/apps/vault");
+
+    // Legacy manifest (no remoteBasePath) switching from /apps/obsidian_vault -> parent /apps
+    const nowSec = Math.floor(Date.now() / 1000);
+    const vault = createMemoryVault(".obsidian");
+    vault.seedFile("keep.md", "precious", nowSec * 1000);
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    vault.seedFile(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        lastSyncTime: nowSec * 1000,
+        files: {
+          "keep.md": {
+            path: "keep.md",
+            remotePath: "/apps/obsidian_vault/keep.md",
+            mtime: nowSec * 1000,
+            remoteMtime: nowSec * 1000,
+            md5: "x",
+            size: 8,
+            remoteSize: 8,
+            fsId: "555"
+          }
+        }
+      })
+    );
+
+    const manifestMgr = new ManifestManager(vault, manifestPath);
+    let settings = makeSettings({
+      remoteBasePath: "apps", // Missing leading '/' AND parent directory of /apps/obsidian_vault!
+      enableE2EE: true,
+      e2eePassword: "FullStrongPassword!"
+    });
+
+    let uploadedCipherPayload: ArrayBuffer | null = null;
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        // Mid-sync user edits e2eePassword character-by-character in Settings!
+        settings.e2eePassword = "p";
+        return makeJsonResponse({ errno: 0, has_more: 0, list: [] });
+      }
+      if (param.url.includes("method=precreate")) {
+        return makeJsonResponse({
+          errno: 0,
+          return_type: 1,
+          uploadid: "u-snap",
+          block_list: [0]
+        });
+      }
+      if (param.url.includes("pcs/superfile2")) {
+        // Extract raw slice from multipart body using the exact Content-Type boundary
+        const raw = new Uint8Array(param.body as ArrayBuffer);
+        const ct = param.headers?.["Content-Type"] || "";
+        const bMatch = ct.match(/boundary=(.+)$/);
+        const boundary = bMatch ? bMatch[1].trim() : "";
+        let startIdx = -1;
+        for (let i = 0; i <= raw.length - 4; i++) {
+          if (raw[i] === 13 && raw[i + 1] === 10 && raw[i + 2] === 13 && raw[i + 3] === 10) {
+            startIdx = i + 4;
+            break;
+          }
+        }
+        const tailMarker = new TextEncoder().encode(`\r\n--${boundary}--`);
+        let endIdx = raw.length;
+        for (let i = startIdx; i <= raw.length - tailMarker.length; i++) {
+          let ok = true;
+          for (let j = 0; j < tailMarker.length; j++) {
+            if (raw[i + j] !== tailMarker[j]) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) {
+            endIdx = i;
+            break;
+          }
+        }
+        uploadedCipherPayload = raw.slice(startIdx, endIdx).buffer;
+        return makeJsonResponse({ md5: md5(uploadedCipherPayload) });
+      }
+      if (param.url.includes("method=create")) {
+        const params = new URLSearchParams(String(param.body || ""));
+        return makeJsonResponse({
+          errno: 0,
+          fs_id: "7777",
+          path: params.get("path") || "",
+          size: Number(params.get("size") || 0),
+          mtime: nowSec + 5,
+          md5: "ok"
+        });
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const engine = new SyncEngine(
+      vault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay }),
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(vault.trashed.length, 0, "Parent-dir remoteBasePath switch must never delete local files");
+    assert.ok(uploadedCipherPayload, "File should have been uploaded encrypted");
+    // Must decrypt with the SNAPSHOTTED password ("FullStrongPassword!"), NOT the mid-sync keystroke "p"!
+    const decrypted = await decryptData(uploadedCipherPayload!, "FullStrongPassword!");
+    assert.strictEqual(new TextDecoder().decode(decrypted), "precious");
+    // And saving lastSyncTime must NOT have clobbered the live settings edit!
+    assert.strictEqual(settings.e2eePassword, "p", "Live settings edits during sync must not be clobbered by snapshot");
+  }
+
+  // 9. statFast lagging cache pre-plan real-disk re-verify prevents false local-modified upload
+  {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const baseVault = createMemoryVault(".obsidian");
+    baseVault.seedFile("cached.md", "synced body", nowSec * 1000);
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    const manifestMgr = new ManifestManager(baseVault, manifestPath);
+    manifestMgr.setRemoteBasePath("/apps/obsidian_vault");
+    manifestMgr.set({
+      path: "cached.md",
+      remotePath: "/apps/obsidian_vault/cached.md",
+      mtime: nowSec * 1000,
+      remoteMtime: nowSec * 1000,
+      md5: md5(new TextEncoder().encode("synced body")),
+      size: 11,
+      remoteSize: 11,
+      fsId: "444"
+    });
+    await manifestMgr.save();
+
+    const laggingVault: VaultSyncBridge & ManifestStorageAdapter = {
+      ...baseVault,
+      // Simulate stale Obsidian TFile.stat lagging behind real disk adapter.stat!
+      statFast: async (path: string) => {
+        if (path === "cached.md") {
+          return { type: "file", mtime: (nowSec - 120) * 1000, size: 5 };
+        }
+        return baseVault.stat(path);
+      }
+    };
+
+    let settings = makeSettings();
+    let uploadAttempted = false;
+    const mockHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        return makeJsonResponse({
+          errno: 0,
+          has_more: 0,
+          list: [
+            {
+              fs_id: "444",
+              path: "/apps/obsidian_vault/cached.md",
+              server_filename: "cached.md",
+              size: 11,
+              isdir: 0,
+              server_mtime: nowSec,
+              server_ctime: nowSec,
+              md5: md5(new TextEncoder().encode("synced body"))
+            }
+          ]
+        });
+      }
+      if (param.url.includes("method=precreate")) {
+        uploadAttempted = true;
+      }
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, mockHttp);
+    const engine = new SyncEngine(
+      laggingVault,
+      () => settings,
+      async (s) => { settings = s; },
+      new BaiduClient(oauth, mockHttp, { delayFn: zeroDelay }),
+      manifestMgr,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const res = await engine.startSync(false);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(uploadAttempted, false, "Real disk re-verify must eliminate false upload from stale statFast");
+  }
+
+  // 10. Manifest .bak backup auto-recovery, save error propagation, bypassMassDeleteGuard & resetLocalBaseline
+  {
+    const vault = createMemoryVault(".obsidian");
+    const manifestPath = ".obsidian/plugins/baidu-netdisk-sync/sync_manifest.json";
+    const mgr = new ManifestManager(vault, manifestPath);
+    mgr.setRemoteBasePath("/apps/obsidian_vault");
+    mgr.set({
+      path: "v1.md",
+      remotePath: "/apps/obsidian_vault/v1.md",
+      mtime: 1000,
+      remoteMtime: 1000,
+      md5: "m1",
+      size: 2,
+      remoteSize: 2,
+      fsId: "1"
+    });
+    await mgr.save();
+
+    // Second save must preserve v1 in .bak before writing v2
+    mgr.set({
+      path: "v2.md",
+      remotePath: "/apps/obsidian_vault/v2.md",
+      mtime: 2000,
+      remoteMtime: 2000,
+      md5: "m2",
+      size: 2,
+      remoteSize: 2,
+      fsId: "2"
+    });
+    await mgr.save();
+    assert.strictEqual(vault.files.has(`${manifestPath}.bak`), true, ".bak backup must exist after second save");
+
+    // Corrupt main sync_manifest.json -> load() MUST automatically recover from .bak!
+    vault.seedFile(manifestPath, "{half-written-crash");
+    const recoveredMgr = new ManifestManager(vault, manifestPath);
+    await recoveredMgr.load();
+    assert.strictEqual(recoveredMgr.wasRecoveredFromBackup(), true, "Should recover automatically from .bak");
+    assert.ok(recoveredMgr.get("v1.md"), "Recovered backup must contain previous baseline entries");
+
+    // Manifest save write error MUST propagate (not silently report success!)
+    const failingSaveAdapter: ManifestStorageAdapter = {
+      ...vault,
+      write: async () => {
+        throw new Error("ENOSPC disk full");
+      }
+    };
+    const failMgr = new ManifestManager(failingSaveAdapter, manifestPath);
+    failMgr.set({
+      path: "x.md",
+      remotePath: "/apps/obsidian_vault/x.md",
+      mtime: 1,
+      remoteMtime: 1,
+      md5: "x",
+      size: 1,
+      remoteSize: 1,
+      fsId: "9"
+    });
+    await assert.rejects(() => failMgr.save(), /ENOSPC/, "ManifestManager.save() must propagate write failures");
+
+    // Circuit breaker bypass once + resetLocalBaseline
+    const nowSec = Math.floor(Date.now() / 1000);
+    const cbVault = createMemoryVault(".obsidian");
+    const cbManifest = new ManifestManager(cbVault, manifestPath);
+    cbManifest.setRemoteBasePath("/apps/obsidian_vault");
+    for (let i = 1; i <= 5; i++) {
+      const p = `n${i}.md`;
+      cbVault.seedFile(p, `body${i}`, nowSec * 1000);
+      cbManifest.set({
+        path: p,
+        remotePath: `/apps/obsidian_vault/${p}`,
+        mtime: nowSec * 1000,
+        remoteMtime: nowSec * 1000,
+        md5: "m",
+        size: 5,
+        remoteSize: 5,
+        fsId: String(i)
+      });
+    }
+    await cbManifest.save();
+
+    let cbSettings = makeSettings();
+    const emptyHttp: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) return makeJsonResponse({ errno: 0, has_more: 0, list: [] });
+      throw new Error(`Unexpected URL: ${param.url}`);
+    };
+    const cbOauth = new BaiduOAuthManager(() => cbSettings, async (s) => { cbSettings = s; }, emptyHttp);
+    const cbEngine = new SyncEngine(
+      cbVault,
+      () => cbSettings,
+      async (s) => { cbSettings = s; },
+      new BaiduClient(cbOauth, emptyHttp, { delayFn: zeroDelay }),
+      cbManifest,
+      ".obsidian/plugins/baidu-netdisk-sync"
+    );
+    const blocked = await cbEngine.startSync(false);
+    assert.strictEqual(blocked.massDeleteAborted, true);
+    assert.strictEqual(cbEngine.wasLastRunMassDeleteAborted(), true);
+
+    // Explicit user-confirmed bypass proceeds
+    const bypassed = await cbEngine.startSync(false, { bypassMassDeleteGuard: true });
+    assert.strictEqual(bypassed.success, true);
+    assert.strictEqual(cbVault.trashed.length, 5);
+    assert.strictEqual(cbEngine.wasLastRunMassDeleteAborted(), false);
+
+    // resetLocalBaseline resets cleanly without deleting files
+    await cbEngine.resetLocalBaseline();
+    assert.deepStrictEqual(Object.keys(cbManifest.getAll()), []);
+  }
+
+  // 11. Same-second same-size remote overwrite detected via fsId change
+  {
+    const local = new Map<string, LocalFileInfo>([["same-sec.md", { path: "same-sec.md", mtime: 5000, size: 3 }]]);
+    const remote = new Map<string, RemoteFileInfo>([
+      ["same-sec.md", { path: "same-sec.md", remotePath: "/apps/obsidian_vault/same-sec.md", mtime: 5000, size: 3, fsId: "200" }]
+    ]);
+    const manifest = {
+      "same-sec.md": {
+        path: "same-sec.md",
+        remotePath: "/apps/obsidian_vault/same-sec.md",
+        mtime: 5000,
+        remoteMtime: 5000,
+        md5: "old",
+        size: 3,
+        remoteSize: 3,
+        fsId: "100"
+      }
+    };
+    const plans = SyncPlanner.plan(local, remote, manifest, "/apps/obsidian_vault");
+    assert.strictEqual(plans.length, 1);
+    assert.strictEqual(plans[0].action, "DOWNLOAD", "fsId change with same mtime and size must detect remote edit");
+  }
+
+  console.log("   All deep-audit P0/P1 protection tests passed!");
+}
+
 async function runAll() {
   testMD5();
   testI18n();
@@ -1144,6 +2456,8 @@ async function runAll() {
   await testBaiduProtocolAndSafety();
   await testSyncEngineIntegration();
   await testBridgeDeadlockCheckpointsAndFastScan();
+  await testDataLossProtectionSuite();
+  await testDeepAuditProtectionsSuite();
   console.log("🎉 All unit & integration tests passed successfully!");
 }
 

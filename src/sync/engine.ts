@@ -2,8 +2,8 @@ import { BaiduSyncSettings } from "../settings/settings";
 import { BaiduClient } from "../baidu/client";
 import { BaiduUploader } from "../baidu/uploader";
 import { BaiduDownloader } from "../baidu/downloader";
-import { BaiduFileMeta, sanitizeErrorMessage } from "../baidu/types";
-import { ManifestManager } from "./manifest";
+import { BaiduFileMeta, FatalApiError, sanitizeErrorMessage } from "../baidu/types";
+import { ManifestItem, ManifestManager } from "./manifest";
 import { SyncFilter } from "./filter";
 import { AsyncQueue, QueueCancelledError } from "./queue";
 import {
@@ -70,6 +70,9 @@ export interface SyncEngineOptions {
   bridgeProbeTimeoutMs?: number;
   checkpointItems?: number;
   checkpointIntervalMs?: number;
+  massDeleteMinCount?: number;
+  massDeleteRatio?: number;
+  emptySideGuardMinManifest?: number;
 }
 
 interface SyncRunContext {
@@ -95,6 +98,9 @@ const ECHO_SUPPRESSION_MS = 3000;
 const DELETE_BATCH_SIZE = 100;
 const DEFAULT_CHECKPOINT_ITEMS = 25;
 const DEFAULT_CHECKPOINT_INTERVAL_MS = 20_000;
+const DEFAULT_MASS_DELETE_MIN_COUNT = 10;
+const DEFAULT_MASS_DELETE_RATIO = 0.5;
+const DEFAULT_EMPTY_SIDE_GUARD_MIN_MANIFEST = 5;
 
 function buffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   if (a.byteLength !== b.byteLength) return false;
@@ -106,10 +112,52 @@ function buffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   return true;
 }
 
+export interface SyncRunOptions {
+  bypassMassDeleteGuard?: boolean;
+}
+
+export interface SyncRunResult {
+  success: boolean;
+  stats: SyncStats;
+  bridgeDead?: boolean;
+  massDeleteAborted?: boolean;
+  manifestCorrupted?: boolean;
+}
+
+export function normalizeAndValidateRemoteBasePath(raw: string): {
+  normalized: string;
+  error?: string;
+} {
+  const trimmed = (raw || "").trim().replace(/\\/g, "/");
+  if (!trimmed) {
+    return { normalized: "", error: t("engine.invalidRemoteBasePath") };
+  }
+  let collapsed = trimmed.replace(/\/+/g, "/");
+  if (!collapsed.startsWith("/")) {
+    collapsed = `/${collapsed}`;
+  }
+  collapsed = collapsed.replace(/\/+$/, "");
+  if (!collapsed || collapsed === "/") {
+    return { normalized: "", error: t("engine.invalidRemoteBasePath") };
+  }
+  const segments = collapsed.split("/").filter(Boolean);
+  if (segments.some((seg) => seg === "." || seg === "..")) {
+    return { normalized: "", error: t("engine.invalidRemoteBasePath") };
+  }
+  return { normalized: collapsed.normalize("NFC") };
+}
+
 function normalizeRemoteBase(remoteBasePath: string): string {
-  const trimmed = remoteBasePath.trim();
+  const { normalized } = normalizeAndValidateRemoteBasePath(remoteBasePath);
+  if (normalized) return normalized;
+  const trimmed = (remoteBasePath || "").trim().replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/+$/, "");
   if (!trimmed || trimmed === "/") return "";
-  return trimmed.replace(/\/+$/, "");
+  return trimmed.startsWith("/") ? trimmed.normalize("NFC") : `/${trimmed}`.normalize("NFC");
+}
+
+function isLikelyExpiredDlinkError(err: unknown): boolean {
+  if (!(err instanceof FatalApiError)) return false;
+  return err.code === 31360 || err.code === 403 || err.code === 400;
 }
 
 export class SyncEngine {
@@ -126,13 +174,19 @@ export class SyncEngine {
   // Strict single-flight run tracking & generation counter to prevent re-entrancy
   private runSeq = 0;
   private activeRunId: number | null = null;
+  private activeCtx: SyncRunContext | null = null;
   private migrationActive = false;
+  private lastRunMassDeleteAborted = false;
+  private lastRunManifestCorrupted = false;
 
   private readonly fsMetaTimeoutMs: number;
   private readonly fsBinaryTimeoutMs: number;
   private readonly bridgeProbeTimeoutMs: number;
   private readonly checkpointItems: number;
   private readonly checkpointIntervalMs: number;
+  private readonly massDeleteMinCount: number;
+  private readonly massDeleteRatio: number;
+  private readonly emptySideGuardMinManifest: number;
 
   constructor(
     private vault: VaultSyncBridge,
@@ -152,6 +206,10 @@ export class SyncEngine {
     this.bridgeProbeTimeoutMs = options.bridgeProbeTimeoutMs ?? BRIDGE_PROBE_TIMEOUT_MS;
     this.checkpointItems = options.checkpointItems ?? DEFAULT_CHECKPOINT_ITEMS;
     this.checkpointIntervalMs = options.checkpointIntervalMs ?? DEFAULT_CHECKPOINT_INTERVAL_MS;
+    this.massDeleteMinCount = options.massDeleteMinCount ?? DEFAULT_MASS_DELETE_MIN_COUNT;
+    this.massDeleteRatio = options.massDeleteRatio ?? DEFAULT_MASS_DELETE_RATIO;
+    this.emptySideGuardMinManifest =
+      options.emptySideGuardMinManifest ?? DEFAULT_EMPTY_SIDE_GUARD_MIN_MANIFEST;
   }
 
   onStateChange(listener: (state: SyncState, message?: string) => void): () => void {
@@ -196,23 +254,65 @@ export class SyncEngine {
     return [...this.logs];
   }
 
+  wasLastRunMassDeleteAborted(): boolean {
+    return this.lastRunMassDeleteAborted;
+  }
+
+  wasLastRunManifestCorrupted(): boolean {
+    return this.lastRunManifestCorrupted;
+  }
+
+  /**
+   * Cleanly cancels any active sync or migration run (e.g. on plugin unload).
+   */
+  abortActiveSync(): void {
+    this.runSeq++;
+    const ctx = this.activeCtx;
+    if (ctx) {
+      ctx.queue.clear(new QueueCancelledError("Plugin unloaded"));
+    }
+  }
+
+  /**
+   * Explicitly resets the local sync_manifest.json baseline without deleting
+   * any local or remote files. Next sync safely re-indexes both sides.
+   */
+  async resetLocalBaseline(): Promise<void> {
+    if (this.isSyncing()) {
+      throw new Error(t("engine.alreadyRunning"));
+    }
+    const { normalized } = normalizeAndValidateRemoteBasePath(this.getSettings().remoteBasePath);
+    await this.manifest.resetBaseline(normalized || undefined);
+    this.lastRunMassDeleteAborted = false;
+    this.lastRunManifestCorrupted = false;
+    this.addLog("warn", t("engine.manifestBaselineReset"));
+    this.setState("idle", t("statusBar.ready"));
+  }
+
+  shouldIgnore(path: string, isDir = false): boolean {
+    this.filter.updateSettings(this.getSettings());
+    return this.filter.shouldIgnore(path, isDir);
+  }
+
   /**
    * Returns true if the given vault path was written or deleted by the sync engine
    * within the echo suppression window (prevents save-trigger ping-pong loops).
    */
   wasRecentlyWrittenBySync(path: string): boolean {
-    const ts = this.recentSyncWrites.get(path);
+    const key = path.normalize("NFC");
+    const ts = this.recentSyncWrites.get(key);
     if (ts === undefined) return false;
     if (Date.now() - ts <= ECHO_SUPPRESSION_MS) {
       return true;
     }
-    this.recentSyncWrites.delete(path);
+    this.recentSyncWrites.delete(key);
     return false;
   }
 
   private markSyncWrite(path: string): void {
+    const key = path.normalize("NFC");
     const now = Date.now();
-    this.recentSyncWrites.set(path, now);
+    this.recentSyncWrites.set(key, now);
     if (this.recentSyncWrites.size > 500) {
       for (const [k, ts] of this.recentSyncWrites) {
         if (now - ts > ECHO_SUPPRESSION_MS) {
@@ -417,10 +517,18 @@ export class SyncEngine {
 
   private async resolveUniqueConflictPath(
     originalPath: string,
+    remoteFiles: Map<string, RemoteFileInfo>,
     ctx: SyncRunContext
   ): Promise<string> {
+    const isOccupied = async (candidate: string): Promise<boolean> => {
+      if (remoteFiles.has(candidate.normalize("NFC"))) {
+        return true;
+      }
+      return ctx.exists(candidate);
+    };
+
     const baseCandidate = buildConflictPath(originalPath);
-    if (!(await ctx.exists(baseCandidate))) {
+    if (!(await isOccupied(baseCandidate))) {
       return baseCandidate;
     }
 
@@ -431,11 +539,70 @@ export class SyncEngine {
       const candidate = hasExt
         ? `${baseCandidate.slice(0, dotIdx)}-${i}${baseCandidate.slice(dotIdx)}`
         : `${baseCandidate}-${i}`;
-      if (!(await ctx.exists(candidate))) {
+      if (!(await isOccupied(candidate))) {
         return candidate;
       }
     }
     return `${baseCandidate}-${Date.now()}`;
+  }
+
+  /**
+   * When zero-IPC statFast (Obsidian in-memory TFile.stat) reports a tracked file as modified,
+   * verify against real disk stat before planning. This keeps 99.9% of unchanged files at 0 IPC
+   * while eliminating false local-change / conflict triggers caused by lagging TFile.stat after
+   * adapter.writeBinary or external editor writes.
+   */
+  private async reverifySuspectedLocalChanges(
+    localFiles: Map<string, LocalFileInfo>,
+    manifestFiles: Record<string, ManifestItem>,
+    ctx: SyncRunContext
+  ): Promise<void> {
+    if (!this.vault.statFast) return;
+
+    for (const [canonicalKey, local] of Array.from(localFiles.entries())) {
+      if (!ctx.isCurrent()) return;
+      const m = manifestFiles[canonicalKey];
+      if (!m) continue;
+
+      const suspectedChange =
+        Math.abs(local.mtime - m.mtime) > 1000 ||
+        local.size !== m.size ||
+        this.wasRecentlyWrittenBySync(local.path);
+      if (!suspectedChange) continue;
+
+      const realStat = await ctx.stat(local.path);
+      if (!realStat || realStat.type !== "file") {
+        localFiles.delete(canonicalKey);
+      } else {
+        local.mtime = realStat.mtime;
+        local.size = realStat.size;
+      }
+    }
+  }
+
+  private async tryCheckpoint(ctx: SyncRunContext, processed: number, totalOps: number): Promise<void> {
+    try {
+      const saved = await this.manifest.maybeCheckpoint(
+        this.checkpointItems,
+        this.checkpointIntervalMs
+      );
+      if (saved && ctx.isCurrent()) {
+        this.addLog("info", t("engine.manifestCheckpoint", { done: processed, total: totalOps }));
+      }
+    } catch (err: unknown) {
+      if (err instanceof OperationTimeoutError && err.kind === "vault") {
+        const alive = await this.probeBridgeHealth(ctx);
+        if (!alive) {
+          const deadlockErr = ctx.bridgeError ?? new BridgeDeadlockError(t("engine.bridgeDeadlock"));
+          ctx.abortRun(deadlockErr);
+          return;
+        }
+      }
+      if (ctx.isCurrent()) {
+        const detail = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+        this.addLog("warn", t("engine.manifestSaveFailed", { detail }));
+      }
+    }
   }
 
   /**
@@ -452,26 +619,31 @@ export class SyncEngine {
     const manifestAll = this.manifest.getAll();
     const maxBytes = this.getMaxBytes(settings);
 
-    for (const [path, local] of localFiles) {
+    for (const [canonicalKey, local] of localFiles) {
       if (!ctx.isCurrent()) return;
-      const remote = remoteFiles.get(path);
+      const remote = remoteFiles.get(canonicalKey);
       if (!remote || !remote.md5) continue;
       if (local.size !== remote.size || local.size > maxBytes) continue;
 
-      const manifestItem = manifestAll[path];
+      const manifestItem = manifestAll[canonicalKey];
       if (manifestItem) {
         const localChanged =
           Math.abs(local.mtime - manifestItem.mtime) > 1000 || local.size !== manifestItem.size;
         const expectedRemoteSize =
           manifestItem.remoteSize !== undefined ? manifestItem.remoteSize : manifestItem.size;
+        const fsIdChanged =
+          Boolean(manifestItem.fsId) &&
+          Boolean(remote.fsId) &&
+          String(remote.fsId) !== String(manifestItem.fsId);
         const remoteChanged =
           Math.abs(remote.mtime - manifestItem.remoteMtime) > 1000 ||
-          remote.size !== expectedRemoteSize;
+          remote.size !== expectedRemoteSize ||
+          fsIdChanged;
         if (!(localChanged && remoteChanged)) continue;
       }
 
       try {
-        const buf = await ctx.readBinary(path);
+        const buf = await ctx.readBinary(local.path);
         local.md5 = md5(buf);
       } catch (err: unknown) {
         if (err instanceof BridgeDeadlockError) {
@@ -482,15 +654,14 @@ export class SyncEngine {
     }
   }
 
-  async startSync(
-    _silent = false
-  ): Promise<{ success: boolean; stats: SyncStats; bridgeDead?: boolean }> {
-    return this.executeSyncRun(false);
+  async startSync(_silent = false, options: SyncRunOptions = {}): Promise<SyncRunResult> {
+    return this.executeSyncRun(false, options);
   }
 
   private async executeSyncRun(
-    allowDuringMigration: boolean
-  ): Promise<{ success: boolean; stats: SyncStats; bridgeDead?: boolean }> {
+    allowDuringMigration: boolean,
+    options: SyncRunOptions = {}
+  ): Promise<SyncRunResult> {
     const stats: SyncStats = {
       uploaded: 0,
       downloaded: 0,
@@ -509,20 +680,38 @@ export class SyncEngine {
       return { success: false, stats };
     }
 
-    const settings = this.getSettings();
+    // Freeze an immutable settings snapshot for this run so keystroke edits in Settings
+    // (e.g. typing e2eePassword or remoteBasePath) can never corrupt in-flight syncs.
+    const settings: BaiduSyncSettings = { ...this.getSettings() };
     if (!settings.accessToken) {
       this.addLog("error", t("engine.notAuthorized"));
       this.setState("error", t("engine.stateNotAuthorized"));
       return { success: false, stats };
     }
 
+    const baseValidation = normalizeAndValidateRemoteBasePath(settings.remoteBasePath);
+    if (baseValidation.error || !baseValidation.normalized) {
+      const msg = baseValidation.error || t("engine.invalidRemoteBasePath");
+      this.addLog("error", msg);
+      this.setState("error", msg);
+      return { success: false, stats };
+    }
+    const cleanBase = baseValidation.normalized;
+    settings.remoteBasePath = cleanBase;
+
     const runId = ++this.runSeq;
     this.activeRunId = runId;
+    this.lastRunMassDeleteAborted = false;
+    this.lastRunManifestCorrupted = false;
     this.filter.updateSettings(settings);
     const ctx = this.createRunContext(runId, settings.concurrency || 3);
+    this.activeCtx = ctx;
 
     const startTime = Date.now();
     const ensuredDirs = new Set<string>();
+    let manifestResetThisRun = false;
+    let completedMutations = 0;
+    let runSucceeded = false;
 
     try {
       this.setState("preparing", t("engine.loadingManifest"));
@@ -537,33 +726,203 @@ export class SyncEngine {
             throw deadlockErr;
           }
         }
+        if (err instanceof Error && err.message === t("engine.manifestCorrupted")) {
+          this.lastRunManifestCorrupted = true;
+        }
         throw err;
+      }
+
+      if (this.manifest.wasRecoveredFromBackup()) {
+        this.addLog("warn", t("engine.manifestRecoveredFromBackup"));
       }
 
       // Step 1: Scan local files
       this.setState("diffing", t("engine.scanningLocal"));
-      const localFiles = await this.scanLocalFiles(ctx);
+      const localFiles = await this.scanLocalFiles(ctx, settings);
 
-      // Step 2: Scan remote files
+      // Step 2: Scan remote files (including case-collision detection)
       this.setState("diffing", t("engine.scanningRemote"));
-      const remoteFiles = await this.scanRemoteFiles(settings.remoteBasePath);
+      const { files: remoteFiles, caseCollisions } = await this.scanRemoteFiles(cleanBase);
 
-      // Step 3: Compute local MD5 for plaintext dedup candidates & build diff plan
+      // Step 3: Guard against remoteBasePath change (reset stale baseline so local files are never wiped)
+      const expectedPrefix = `${cleanBase}/`;
+      const existingManifestFiles = this.manifest.getAll();
+      const existingManifestKeys = Object.keys(existingManifestFiles);
+      const savedBase = this.manifest.getRemoteBasePath();
+
+      if (existingManifestKeys.length > 0) {
+        let baseChanged = false;
+        let previousBaseLabel = savedBase ? normalizeRemoteBase(savedBase) || "/" : "";
+
+        if (savedBase !== undefined) {
+          baseChanged = normalizeRemoteBase(savedBase) !== cleanBase;
+        } else {
+          // Strict exact path check (`${expectedPrefix}${k}`) catches parent-dir switches
+          // like `/apps/obsidian_vault` -> `/apps`, unlike a loose startsWith check.
+          const anyExactMatch = existingManifestKeys.some((k) => {
+            const rp = existingManifestFiles[k]?.remotePath;
+            return (
+              typeof rp === "string" &&
+              rp.normalize("NFC") === `${expectedPrefix}${k.normalize("NFC")}`
+            );
+          });
+          if (!anyExactMatch) {
+            baseChanged = true;
+            const sample = existingManifestFiles[existingManifestKeys[0]];
+            if (sample && typeof sample.remotePath === "string" && sample.remotePath.endsWith(`/${sample.path}`)) {
+              previousBaseLabel = sample.remotePath.slice(0, -(sample.path.length + 1)) || "/";
+            } else {
+              previousBaseLabel = "(previous)";
+            }
+          }
+        }
+
+        if (baseChanged) {
+          this.addLog(
+            "warn",
+            t("engine.remoteBaseChanged", {
+              previous: previousBaseLabel || "/",
+              current: cleanBase
+            })
+          );
+          this.manifest.resetForRemoteBase(cleanBase);
+          manifestResetThisRun = true;
+        } else {
+          this.manifest.setRemoteBasePath(cleanBase);
+        }
+      } else {
+        this.manifest.setRemoteBasePath(cleanBase);
+      }
+
+      // Exclude case-colliding remote paths (and matching local/manifest entries) from planning
+      const collidedLowerKeys = new Set<string>();
+      for (const group of caseCollisions) {
+        stats.errors++;
+        this.addLog("error", t("engine.caseCollisionSkipped", { paths: group.join(", ") }));
+        for (const p of group) {
+          collidedLowerKeys.add(p.toLowerCase());
+        }
+      }
+
+      const rawManifestFiles = this.manifest.getAll();
+      let activeManifestFiles = rawManifestFiles;
+      if (collidedLowerKeys.size > 0) {
+        for (const key of Array.from(localFiles.keys())) {
+          if (collidedLowerKeys.has(key.toLowerCase())) {
+            localFiles.delete(key);
+          }
+        }
+        const filteredManifest: Record<string, ManifestItem> = {};
+        for (const [k, v] of Object.entries(rawManifestFiles)) {
+          if (!collidedLowerKeys.has(k.toLowerCase())) {
+            filteredManifest[k] = v;
+          }
+        }
+        activeManifestFiles = filteredManifest;
+      }
+
+      // Step 3.2: Verify any statFast-suspected local changes against real disk stat
+      await this.reverifySuspectedLocalChanges(localFiles, activeManifestFiles, ctx);
+
+      // Compute local MD5 for plaintext dedup candidates & build diff plan
       this.setState("diffing", t("engine.computingPlan"));
       await this.populateCandidateLocalMd5(localFiles, remoteFiles, settings, ctx);
 
       const plans = SyncPlanner.plan(
         localFiles,
         remoteFiles,
-        this.manifest.getAll(),
-        settings.remoteBasePath,
+        activeManifestFiles,
+        cleanBase,
         {
           conflictStrategy: settings.conflictStrategy,
           enableE2EE: settings.enableE2EE
         }
       );
 
+      // Step 3.5: Bidirectional mass-deletion safety circuit breaker
+      let trackedCount = 0;
+      for (const k of Object.keys(activeManifestFiles)) {
+        if (!this.filter.shouldIgnore(k, false)) {
+          trackedCount++;
+        }
+      }
+      const localDeleteCount = plans.filter((p) => p.action === "DELETE_LOCAL").length;
+      const remoteDeleteCount = plans.filter((p) => p.action === "DELETE_REMOTE").length;
+
+      const localWipeEmptyRemote =
+        trackedCount >= this.emptySideGuardMinManifest &&
+        remoteFiles.size === 0 &&
+        localDeleteCount >= this.emptySideGuardMinManifest;
+      const localWipeMass =
+        localDeleteCount >= this.massDeleteMinCount &&
+        trackedCount > 0 &&
+        localDeleteCount / trackedCount >= this.massDeleteRatio;
+
+      const remoteWipeEmptyLocal =
+        trackedCount >= this.emptySideGuardMinManifest &&
+        localFiles.size === 0 &&
+        remoteDeleteCount >= this.emptySideGuardMinManifest;
+      const remoteWipeMass =
+        remoteDeleteCount >= this.massDeleteMinCount &&
+        trackedCount > 0 &&
+        remoteDeleteCount / trackedCount >= this.massDeleteRatio;
+
+      if (localWipeEmptyRemote || localWipeMass) {
+        if (options.bypassMassDeleteGuard) {
+          this.addLog("warn", t("engine.massDeleteBypassed"));
+        } else {
+          const msg = t("engine.massDeleteLocalAborted", {
+            count: localDeleteCount,
+            total: trackedCount,
+            remoteCount: remoteFiles.size
+          });
+          this.lastRunMassDeleteAborted = true;
+          this.addLog("error", msg);
+          this.setState("error", msg);
+          return { success: false, stats, massDeleteAborted: true };
+        }
+      }
+
+      if (remoteWipeEmptyLocal || remoteWipeMass) {
+        if (options.bypassMassDeleteGuard) {
+          this.addLog("warn", t("engine.massDeleteBypassed"));
+        } else {
+          const msg = t("engine.massDeleteRemoteAborted", {
+            count: remoteDeleteCount,
+            total: trackedCount,
+            localCount: localFiles.size
+          });
+          this.lastRunMassDeleteAborted = true;
+          this.addLog("error", msg);
+          this.setState("error", msg);
+          return { success: false, stats, massDeleteAborted: true };
+        }
+      }
+
       if (plans.length === 0) {
+        if (this.manifest.isDirty()) {
+          this.manifest.setRemoteBasePath(cleanBase);
+          this.manifest.updateLastSyncTime();
+          await this.manifest.save();
+        }
+        runSucceeded = true;
+        if (stats.errors > 0) {
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+          this.addLog(
+            "warn",
+            t("engine.summary", {
+              elapsed,
+              uploaded: stats.uploaded,
+              downloaded: stats.downloaded,
+              deleted: stats.deleted,
+              conflicts: stats.conflicts,
+              skipped: stats.skipped,
+              errors: stats.errors
+            })
+          );
+          this.setState("idle", t("engine.stateComplete"));
+          return { success: false, stats };
+        }
         this.addLog("info", t("engine.upToDate"));
         this.setState("idle", t("engine.stateUpToDate"));
         return { success: true, stats };
@@ -585,114 +944,150 @@ export class SyncEngine {
         prefetchedMetas = await this.client.getFileMetas(downloadFsIds);
       }
 
-      // Separate batchable DELETE_REMOTE operations from concurrent file operations
+      // Phased execution order:
+      // 1) Batched DELETE_REMOTE (with local existence TOCTOU guard)
+      // 2) DELETE_LOCAL phase (must finish strictly BEFORE DOWNLOAD/UPLOAD/CONFLICT so
+      //    case-only renames like Note.md -> note.md never delete the freshly downloaded file
+      //    on case-insensitive macOS/Windows/iOS filesystems)
+      // 3) Remaining concurrent UPLOAD / DOWNLOAD / CONFLICT / manifest updates
       const remoteDeleteItems = plans.filter((p) => p.action === "DELETE_REMOTE");
-      const otherItems = plans.filter((p) => p.action !== "DELETE_REMOTE");
+      const localDeleteItems = plans.filter((p) => p.action === "DELETE_LOCAL");
+      const otherItems = plans.filter(
+        (p) => p.action !== "DELETE_REMOTE" && p.action !== "DELETE_LOCAL"
+      );
 
       const totalOps = plans.length;
       let processed = 0;
       this.setState("syncing", t("engine.syncProgress", { done: 0, total: totalOps }));
 
-      // Execute batched remote deletions first (up to 100 paths per API call)
+      // Phase 1: Execute batched remote deletions (up to 100 paths per API call)
       for (let i = 0; i < remoteDeleteItems.length; i += DELETE_BATCH_SIZE) {
         if (!ctx.isCurrent()) break;
         const batch = remoteDeleteItems.slice(i, i + DELETE_BATCH_SIZE);
-        const remotePaths = batch.map((b) => b.remotePath);
-        try {
-          await this.client.deleteFiles(remotePaths);
+
+        // TOCTOU check: never delete remote file if user restored/created it locally during scan
+        const toDelete: SyncPlanItem[] = [];
+        for (const b of batch) {
           if (!ctx.isCurrent()) break;
-          for (const b of batch) {
-            this.manifest.delete(b.path);
-          }
-          stats.deleted += batch.length;
-          if (batch.length === 1) {
-            this.addLog("info", t("engine.deleteRemoteSuccess", { path: batch[0].path }));
+          const localDiskPath = b.local?.path ?? b.path;
+          if (await ctx.exists(localDiskPath)) {
+            stats.skipped++;
+            this.addLog("warn", t("engine.deleteRemoteSkippedRestored", { path: b.path }));
           } else {
-            this.addLog("info", t("engine.batchDeleteRemoteSuccess", { count: batch.length }));
+            toDelete.push(b);
           }
-        } catch (err: unknown) {
-          stats.errors += batch.length;
-          const msg = err instanceof Error ? err.message : String(err);
-          this.addLog(
-            "error",
-            t("engine.itemFailed", { path: batch.map((b) => b.path).join(", ") }),
-            msg
-          );
-        } finally {
-          if (ctx.isCurrent()) {
-            processed += batch.length;
-            this.setState("syncing", t("engine.syncProgress", { done: processed, total: totalOps }));
-            const saved = await this.manifest.maybeCheckpoint(
-              this.checkpointItems,
-              this.checkpointIntervalMs
-            );
-            if (saved && ctx.isCurrent()) {
-              this.addLog("info", t("engine.manifestCheckpoint", { done: processed, total: totalOps }));
+        }
+
+        if (toDelete.length > 0 && ctx.isCurrent()) {
+          const remotePaths = toDelete.map((b) => b.remotePath);
+          try {
+            await this.client.deleteFiles(remotePaths);
+            if (!ctx.isCurrent()) break;
+            for (const b of toDelete) {
+              this.manifest.delete(b.path);
             }
+            completedMutations += toDelete.length;
+            stats.deleted += toDelete.length;
+            if (toDelete.length === 1) {
+              this.addLog("info", t("engine.deleteRemoteSuccess", { path: toDelete[0].path }));
+            } else {
+              this.addLog("info", t("engine.batchDeleteRemoteSuccess", { count: toDelete.length }));
+            }
+          } catch (err: unknown) {
+            stats.errors += toDelete.length;
+            const msg = err instanceof Error ? err.message : String(err);
+            this.addLog(
+              "error",
+              t("engine.itemFailed", { path: toDelete.map((b) => b.path).join(", ") }),
+              msg
+            );
           }
+        }
+
+        if (ctx.isCurrent()) {
+          processed += batch.length;
+          this.setState("syncing", t("engine.syncProgress", { done: processed, total: totalOps }));
+          await this.tryCheckpoint(ctx, processed, totalOps);
         }
       }
 
-      // Execute remaining items with true concurrency via per-run AsyncQueue
-      const tasks = otherItems.map((item) =>
-        ctx.queue.add(async () => {
-          if (!ctx.isCurrent()) return;
-          try {
-            const outcome = await this.executePlanItem(
-              item,
-              settings,
-              prefetchedMetas,
-              ensuredDirs,
-              ctx
-            );
+      const runQueuedPhase = async (items: SyncPlanItem[]): Promise<void> => {
+        if (items.length === 0 || !ctx.isCurrent()) return;
+
+        const tasks = items.map((item) =>
+          ctx.queue.add(async () => {
             if (!ctx.isCurrent()) return;
-            if (outcome === "uploaded") stats.uploaded++;
-            else if (outcome === "downloaded") stats.downloaded++;
-            else if (outcome === "deleted") stats.deleted++;
-            else if (outcome === "conflict") stats.conflicts++;
-            else if (outcome === "skipped") stats.skipped++;
-          } catch (err: unknown) {
-            if (err instanceof BridgeDeadlockError || err instanceof QueueCancelledError) {
-              return;
-            }
-            if (!ctx.isCurrent()) return;
-            stats.errors++;
-            const msg = err instanceof Error ? err.message : String(err);
-            this.addLog("error", t("engine.itemFailed", { path: item.path }), msg);
-          } finally {
-            if (ctx.isCurrent()) {
-              processed++;
-              this.setState("syncing", t("engine.syncProgress", { done: processed, total: totalOps }));
-              const saved = await this.manifest.maybeCheckpoint(
-                this.checkpointItems,
-                this.checkpointIntervalMs
+            try {
+              const outcome = await this.executePlanItem(
+                item,
+                settings,
+                prefetchedMetas,
+                remoteFiles,
+                ensuredDirs,
+                ctx
               );
-              if (saved && ctx.isCurrent()) {
-                this.addLog(
-                  "info",
-                  t("engine.manifestCheckpoint", { done: processed, total: totalOps })
-                );
+              if (!ctx.isCurrent()) return;
+              if (outcome === "uploaded") {
+                stats.uploaded++;
+                completedMutations++;
+              } else if (outcome === "downloaded") {
+                stats.downloaded++;
+                completedMutations++;
+              } else if (outcome === "deleted") {
+                stats.deleted++;
+                completedMutations++;
+              } else if (outcome === "conflict") {
+                stats.conflicts++;
+                completedMutations++;
+              } else if (outcome === "skipped") {
+                stats.skipped++;
+              } else if (outcome === "manifest") {
+                completedMutations++;
+              }
+            } catch (err: unknown) {
+              if (err instanceof BridgeDeadlockError || err instanceof QueueCancelledError) {
+                return;
+              }
+              if (!ctx.isCurrent()) return;
+              stats.errors++;
+              const msg = err instanceof Error ? err.message : String(err);
+              this.addLog("error", t("engine.itemFailed", { path: item.path }), msg);
+            } finally {
+              if (ctx.isCurrent()) {
+                processed++;
+                this.setState("syncing", t("engine.syncProgress", { done: processed, total: totalOps }));
+                await this.tryCheckpoint(ctx, processed, totalOps);
               }
             }
-          }
-        })
-      );
+          })
+        );
 
-      const allTasksPromise = Promise.all(tasks);
-      // Suppress rejection from cancelled queue entries when abortPromise wins the race
-      allTasksPromise.catch(() => {});
+        const phasePromise = Promise.all(tasks);
+        phasePromise.catch(() => {});
 
-      await Promise.race([allTasksPromise, ctx.abortPromise]);
-      if (!ctx.bridgeDead) {
-        await ctx.queue.waitAll();
-      }
+        await Promise.race([phasePromise, ctx.abortPromise]);
+        if (!ctx.bridgeDead) {
+          await ctx.queue.waitAll();
+        }
+      };
 
-      // Step 5: Final manifest & settings save
+      // Phase 2: Complete all DELETE_LOCAL before any DOWNLOAD/UPLOAD/CONFLICT
+      await runQueuedPhase(localDeleteItems);
+
+      // Phase 3: Execute concurrent UPLOAD / DOWNLOAD / CONFLICT / manifest updates
+      await runQueuedPhase(otherItems);
+
+      // Step 5: Final manifest & settings save (write failure MUST fail the run)
+      this.manifest.setRemoteBasePath(cleanBase);
       this.manifest.updateLastSyncTime();
       await this.manifest.save();
+      runSucceeded = true;
 
-      settings.lastSyncTime = Date.now();
-      await this.saveSettings(settings);
+      // Write lastSyncTime onto the LIVE settings object so we never clobber
+      // refreshed OAuth tokens or user edits made while sync was running.
+      const latestSettings = this.getSettings();
+      latestSettings.lastSyncTime = Date.now();
+      await this.saveSettings(latestSettings);
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       const summary = t("engine.summary", {
@@ -719,16 +1114,33 @@ export class SyncEngine {
       const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
       this.addLog("error", t("engine.fatalError"), msg);
       this.setState("error", msg);
-      return { success: false, stats };
+      return {
+        success: false,
+        stats,
+        manifestCorrupted: this.lastRunManifestCorrupted || undefined
+      };
     } finally {
       ctx.queue.clear();
-      // Best-effort flush of any completed items if bridge is still responsive
-      if (!ctx.bridgeDead && this.manifest.isDirty()) {
+      // Best-effort flush of completed items if bridge is still responsive.
+      // Never persist an empty baseline reset if the run aborted before completing any mutation.
+      const shouldSkipResetFlush = manifestResetThisRun && completedMutations === 0 && !runSucceeded;
+      if (!ctx.bridgeDead && !shouldSkipResetFlush && this.manifest.isDirty()) {
+        this.manifest.setRemoteBasePath(cleanBase);
         this.manifest.updateLastSyncTime();
-        await this.manifest.save();
+        try {
+          await this.manifest.save();
+        } catch (saveErr: unknown) {
+          const detail = sanitizeErrorMessage(
+            saveErr instanceof Error ? saveErr.message : String(saveErr)
+          );
+          this.addLog("error", t("engine.manifestSaveFailed", { detail }));
+        }
       }
       if (this.activeRunId === runId) {
         this.activeRunId = null;
+      }
+      if (this.activeCtx === ctx) {
+        this.activeCtx = null;
       }
     }
   }
@@ -741,24 +1153,35 @@ export class SyncEngine {
     if (!item.remote?.fsId) {
       throw new Error(t("engine.missingFsId", { path: item.path }));
     }
+    const downloadOpts = {
+      e2eePassword: settings.e2eePassword,
+      expectedSize: item.remote.size
+    };
     const meta = prefetchedMetas.get(String(item.remote.fsId));
     if (meta && meta.dlink) {
-      return this.downloader.downloadWithMeta(meta, {
-        e2eePassword: settings.e2eePassword
-      });
+      try {
+        return await this.downloader.downloadWithMeta(meta, downloadOpts);
+      } catch (err: unknown) {
+        if (isLikelyExpiredDlinkError(err)) {
+          this.addLog("warn", t("engine.dlinkRefreshed", { path: item.path }));
+          return this.downloader.downloadByFsId(item.remote.fsId, downloadOpts);
+        }
+        throw err;
+      }
     }
-    return this.downloader.downloadByFsId(item.remote.fsId, {
-      e2eePassword: settings.e2eePassword
-    });
+    return this.downloader.downloadByFsId(item.remote.fsId, downloadOpts);
   }
 
   private async executePlanItem(
     item: SyncPlanItem,
     settings: BaiduSyncSettings,
     prefetchedMetas: Map<string, BaiduFileMeta>,
+    remoteFiles: Map<string, RemoteFileInfo>,
     ensuredDirs: Set<string>,
     ctx: SyncRunContext
-  ): Promise<"uploaded" | "downloaded" | "deleted" | "conflict" | "skipped" | "none"> {
+  ): Promise<"uploaded" | "downloaded" | "deleted" | "conflict" | "skipped" | "manifest" | "none"> {
+    const localDiskPath = item.local?.path ?? item.path;
+
     switch (item.action) {
       case "UPLOAD": {
         if (item.local && this.isOversized(item.local.size, settings, item.path)) {
@@ -767,7 +1190,7 @@ export class SyncEngine {
 
         let buffer: ArrayBuffer;
         try {
-          buffer = await ctx.readBinary(item.path);
+          buffer = await ctx.readBinary(localDiskPath);
         } catch (err: unknown) {
           if (
             err instanceof BridgeDeadlockError ||
@@ -777,7 +1200,7 @@ export class SyncEngine {
             throw err;
           }
           // File may have been deleted between scan and upload
-          if (!(await ctx.exists(item.path))) {
+          if (!(await ctx.exists(localDiskPath))) {
             return "none";
           }
           throw err;
@@ -789,10 +1212,28 @@ export class SyncEngine {
 
         let localMtime = item.local?.mtime;
         let localSize = item.local?.size ?? buffer.byteLength;
-        if (localMtime === undefined) {
-          const stat = await ctx.stat(item.path);
-          localMtime = stat?.mtime || Date.now();
-          localSize = stat?.size ?? buffer.byteLength;
+        if (localMtime === undefined || buffer.byteLength !== localSize) {
+          // File changed size between scan and readBinary: re-stat & re-read once to bind exact stat to buffer
+          const preStat = await ctx.stat(localDiskPath);
+          if (!preStat || preStat.type !== "file") {
+            return "none";
+          }
+          buffer = await ctx.readBinary(localDiskPath);
+          if (this.isOversized(buffer.byteLength, settings, item.path)) {
+            return "skipped";
+          }
+          const postStat = await ctx.stat(localDiskPath);
+          if (
+            !postStat ||
+            postStat.type !== "file" ||
+            postStat.size !== buffer.byteLength ||
+            Math.abs(postStat.mtime - preStat.mtime) > 1000
+          ) {
+            this.addLog("warn", t("engine.uploadSkippedModified", { path: item.path }));
+            return "skipped";
+          }
+          localMtime = preStat.mtime;
+          localSize = buffer.byteLength;
         }
 
         const res = await this.uploader.uploadFile(item.remotePath, buffer, {
@@ -831,10 +1272,30 @@ export class SyncEngine {
           return "none";
         }
 
-        await this.ensureParentDir(item.path, ensuredDirs, ctx);
-        this.markSyncWrite(item.path);
-        await ctx.writeBinary(item.path, buffer);
-        const stat = await ctx.stat(item.path);
+        // TOCTOU protection before overwriting local disk:
+        // If user edited the local file (or created a brand-new local file at this path)
+        // during scan/download, NEVER overwrite silently — skip and let next sync diff safely.
+        const currentStat = await ctx.stat(localDiskPath);
+        if (item.local) {
+          if (
+            currentStat &&
+            currentStat.type === "file" &&
+            (Math.abs(currentStat.mtime - item.local.mtime) > 1000 ||
+              currentStat.size !== item.local.size)
+          ) {
+            this.addLog("warn", t("engine.downloadSkippedModified", { path: item.path }));
+            return "skipped";
+          }
+        } else if (currentStat !== null) {
+          this.addLog("warn", t("engine.downloadSkippedModified", { path: item.path }));
+          return "skipped";
+        }
+
+        await this.ensureParentDir(localDiskPath, ensuredDirs, ctx);
+        this.markSyncWrite(localDiskPath);
+        await ctx.writeBinary(localDiskPath, buffer);
+        this.markSyncWrite(localDiskPath);
+        const stat = await ctx.stat(localDiskPath);
 
         if (!ctx.isCurrent()) {
           return "none";
@@ -865,8 +1326,15 @@ export class SyncEngine {
           return "skipped";
         }
 
+        // Capture real disk stat BEFORE reading so any subsequent user edit is never masked
+        const preLocalStat = await ctx.stat(localDiskPath);
+        if (!preLocalStat || preLocalStat.type !== "file") {
+          this.addLog("warn", t("engine.conflictSkippedModified", { path: item.path }));
+          return "skipped";
+        }
+
         const [localBuffer, remoteBuffer] = await Promise.all([
-          ctx.readBinary(item.path),
+          ctx.readBinary(localDiskPath),
           this.downloadItemBuffer(item, settings, prefetchedMetas)
         ]);
 
@@ -874,14 +1342,18 @@ export class SyncEngine {
           return "none";
         }
 
+        // Confirm local file didn't mutate mid-read
+        if (localBuffer.byteLength !== preLocalStat.size) {
+          this.addLog("warn", t("engine.conflictSkippedModified", { path: item.path }));
+          return "skipped";
+        }
+
         // If decrypted contents are byte-for-byte identical, skip creating any conflict copy
         if (buffersEqual(localBuffer, remoteBuffer)) {
-          const stat = await ctx.stat(item.path);
-          if (!ctx.isCurrent()) return "none";
           this.manifest.set({
             path: item.path,
             remotePath: item.remotePath,
-            mtime: stat?.mtime || item.local.mtime,
+            mtime: preLocalStat.mtime,
             remoteMtime: item.remote.mtime,
             md5: item.remote.md5 || "",
             size: localBuffer.byteLength,
@@ -889,13 +1361,13 @@ export class SyncEngine {
             fsId: item.remote.fsId
           });
           this.addLog("info", t("engine.conflictIdentical", { path: item.path }));
-          return "none";
+          return "manifest";
         }
 
-        const conflictPath = await this.resolveUniqueConflictPath(item.path, ctx);
+        const conflictPath = await this.resolveUniqueConflictPath(item.path, remoteFiles, ctx);
         const cleanBase = normalizeRemoteBase(settings.remoteBasePath);
         const conflictRemotePath = `${cleanBase}/${conflictPath}`;
-        const winner = item.winner ?? (item.local.mtime >= item.remote.mtime ? "local" : "remote");
+        const winner = item.winner ?? (preLocalStat.mtime >= item.remote.mtime ? "local" : "remote");
 
         await this.ensureParentDir(conflictPath, ensuredDirs, ctx);
 
@@ -903,6 +1375,7 @@ export class SyncEngine {
           // Preserve remote version as conflict copy locally & remotely, then push local as main
           this.markSyncWrite(conflictPath);
           await ctx.writeBinary(conflictPath, remoteBuffer);
+          this.markSyncWrite(conflictPath);
           const conflictStat = await ctx.stat(conflictPath);
           const conflictUploadRes = await this.uploader.uploadFile(conflictRemotePath, remoteBuffer, {
             enableE2EE: settings.enableE2EE,
@@ -920,16 +1393,17 @@ export class SyncEngine {
             fsId: conflictUploadRes.fs_id
           });
 
-          const localStat = await ctx.stat(item.path);
           const mainUploadRes = await this.uploader.uploadFile(item.remotePath, localBuffer, {
             enableE2EE: settings.enableE2EE,
             e2eePassword: settings.e2eePassword
           });
           if (!ctx.isCurrent()) return "none";
+          // Record preLocalStat.mtime (exact mtime of localBuffer), NOT post-upload stat,
+          // so edits made while uploading are detected and synced on the next run.
           this.manifest.set({
             path: item.path,
             remotePath: item.remotePath,
-            mtime: localStat?.mtime || item.local.mtime,
+            mtime: preLocalStat.mtime,
             remoteMtime: (mainUploadRes.mtime || Math.floor(Date.now() / 1000)) * 1000,
             md5: mainUploadRes.md5 || "",
             size: localBuffer.byteLength,
@@ -937,9 +1411,22 @@ export class SyncEngine {
             fsId: mainUploadRes.fs_id
           });
         } else {
+          // Re-check local file before overwriting main path with remoteBuffer
+          const latestLocalStat = await ctx.stat(localDiskPath);
+          if (
+            !latestLocalStat ||
+            latestLocalStat.type !== "file" ||
+            Math.abs(latestLocalStat.mtime - preLocalStat.mtime) > 1000 ||
+            latestLocalStat.size !== preLocalStat.size
+          ) {
+            this.addLog("warn", t("engine.conflictSkippedModified", { path: item.path }));
+            return "skipped";
+          }
+
           // Preserve local version as conflict copy locally & remotely, then apply remote as main
           this.markSyncWrite(conflictPath);
           await ctx.writeBinary(conflictPath, localBuffer);
+          this.markSyncWrite(conflictPath);
           const conflictStat = await ctx.stat(conflictPath);
           const conflictUploadRes = await this.uploader.uploadFile(conflictRemotePath, localBuffer, {
             enableE2EE: settings.enableE2EE,
@@ -957,9 +1444,22 @@ export class SyncEngine {
             fsId: conflictUploadRes.fs_id
           });
 
-          this.markSyncWrite(item.path);
-          await ctx.writeBinary(item.path, remoteBuffer);
-          const mainStat = await ctx.stat(item.path);
+          // Final TOCTOU check right before overwriting main local file
+          const beforeOverwriteStat = await ctx.stat(localDiskPath);
+          if (
+            beforeOverwriteStat &&
+            beforeOverwriteStat.type === "file" &&
+            (Math.abs(beforeOverwriteStat.mtime - preLocalStat.mtime) > 1000 ||
+              beforeOverwriteStat.size !== preLocalStat.size)
+          ) {
+            this.addLog("warn", t("engine.conflictSkippedModified", { path: item.path }));
+            return "skipped";
+          }
+
+          this.markSyncWrite(localDiskPath);
+          await ctx.writeBinary(localDiskPath, remoteBuffer);
+          this.markSyncWrite(localDiskPath);
+          const mainStat = await ctx.stat(localDiskPath);
           if (!ctx.isCurrent()) return "none";
           this.manifest.set({
             path: item.path,
@@ -989,14 +1489,28 @@ export class SyncEngine {
             remoteSize: item.remote.size,
             fsId: item.remote.fsId
           });
+          return "manifest";
         }
         return "none";
       }
 
       case "DELETE_LOCAL": {
-        if (await ctx.exists(item.path)) {
-          this.markSyncWrite(item.path);
-          await ctx.trashFile(item.path);
+        if (await ctx.exists(localDiskPath)) {
+          // Re-stat right before deleting to prevent TOCTOU loss if user edited during remote scan
+          const currentStat = await ctx.stat(localDiskPath);
+          if (
+            currentStat &&
+            currentStat.type === "file" &&
+            item.manifest &&
+            (Math.abs(currentStat.mtime - item.manifest.mtime) > 1000 ||
+              currentStat.size !== item.manifest.size)
+          ) {
+            this.addLog("warn", t("engine.deleteLocalSkippedModified", { path: item.path }));
+            return "skipped";
+          }
+          this.markSyncWrite(localDiskPath);
+          await ctx.trashFile(localDiskPath);
+          this.markSyncWrite(localDiskPath);
           this.addLog("info", t("engine.deleteLocalSuccess", { path: item.path }));
         }
         if (ctx.isCurrent()) {
@@ -1008,6 +1522,7 @@ export class SyncEngine {
       case "CLEAN_MANIFEST": {
         if (ctx.isCurrent()) {
           this.manifest.delete(item.path);
+          return "manifest";
         }
         return "none";
       }
@@ -1024,10 +1539,17 @@ export class SyncEngine {
       throw new Error(t("migration.alreadyRunning"));
     }
 
-    const settings = this.getSettings();
+    const settings: BaiduSyncSettings = { ...this.getSettings() };
     if (!settings.accessToken) {
       throw new Error(t("migration.notAuthorized"));
     }
+
+    const baseValidation = normalizeAndValidateRemoteBasePath(settings.remoteBasePath);
+    if (baseValidation.error || !baseValidation.normalized) {
+      throw new Error(baseValidation.error || t("engine.invalidRemoteBasePath"));
+    }
+    const cleanBase = baseValidation.normalized;
+    settings.remoteBasePath = cleanBase;
 
     this.migrationActive = true;
     try {
@@ -1045,10 +1567,11 @@ export class SyncEngine {
       this.activeRunId = runId;
       this.filter.updateSettings(settings);
       const ctx = this.createRunContext(runId, settings.concurrency || 3);
+      this.activeCtx = ctx;
 
       try {
         this.setState("diffing", t("migration.scanningLocal"));
-        const localFiles = await this.scanLocalFiles(ctx);
+        const localFiles = await this.scanLocalFiles(ctx, settings);
         const total = localFiles.size;
         let processed = 0;
         let skipped = 0;
@@ -1056,21 +1579,21 @@ export class SyncEngine {
 
         this.addLog("info", t("migration.step2Log", { total }));
 
-        const cleanBase = normalizeRemoteBase(settings.remoteBasePath);
         this.setState("syncing", t("migration.step2Progress", { done: 0, total }));
 
         const entries = Array.from(localFiles.entries());
-        const tasks = entries.map(([path, fileInfo]) =>
+        const tasks = entries.map(([canonicalPath, fileInfo]) =>
           ctx.queue.add(async () => {
             if (!ctx.isCurrent()) return;
+            const localDiskPath = fileInfo.path;
             try {
-              if (this.isOversized(fileInfo.size, settings, path)) {
+              if (this.isOversized(fileInfo.size, settings, canonicalPath)) {
                 skipped++;
                 return;
               }
               let buffer: ArrayBuffer;
               try {
-                buffer = await ctx.readBinary(path);
+                buffer = await ctx.readBinary(localDiskPath);
               } catch (err: unknown) {
                 if (
                   err instanceof BridgeDeadlockError ||
@@ -1079,17 +1602,17 @@ export class SyncEngine {
                 ) {
                   throw err;
                 }
-                if (!(await ctx.exists(path))) {
+                if (!(await ctx.exists(localDiskPath))) {
                   return;
                 }
                 throw err;
               }
-              if (this.isOversized(buffer.byteLength, settings, path)) {
+              if (this.isOversized(buffer.byteLength, settings, canonicalPath)) {
                 skipped++;
                 return;
               }
               const localMtime = fileInfo.mtime || Date.now();
-              const remotePath = `${cleanBase}/${path}`;
+              const remotePath = `${cleanBase}/${canonicalPath}`;
 
               // Explicitly upload with enableE2EE: false -> Pure Plaintext
               const res = await this.uploader.uploadFile(remotePath, buffer, {
@@ -1099,16 +1622,16 @@ export class SyncEngine {
               if (!ctx.isCurrent()) return;
 
               this.manifest.set({
-                path: path,
+                path: canonicalPath,
                 remotePath: remotePath,
                 mtime: localMtime,
                 remoteMtime: (res.mtime || Math.floor(Date.now() / 1000)) * 1000,
                 md5: res.md5 || "",
-                size: fileInfo.size ?? buffer.byteLength,
+                size: buffer.byteLength,
                 remoteSize: res.size,
                 fsId: res.fs_id
               });
-              this.addLog("success", t("migration.uploadSuccess", { path }));
+              this.addLog("success", t("migration.uploadSuccess", { path: canonicalPath }));
             } catch (err: unknown) {
               if (err instanceof BridgeDeadlockError || err instanceof QueueCancelledError) {
                 return;
@@ -1116,16 +1639,13 @@ export class SyncEngine {
               if (!ctx.isCurrent()) return;
               errors++;
               const msg = err instanceof Error ? err.message : String(err);
-              this.addLog("error", t("migration.uploadFailed", { path }), msg);
+              this.addLog("error", t("migration.uploadFailed", { path: canonicalPath }), msg);
             } finally {
               if (ctx.isCurrent()) {
                 processed++;
-                onProgress?.(processed, total, path);
+                onProgress?.(processed, total, canonicalPath);
                 this.setState("syncing", t("migration.step2Progress", { done: processed, total }));
-                await this.manifest.maybeCheckpoint(
-                  this.checkpointItems,
-                  this.checkpointIntervalMs
-                );
+                await this.tryCheckpoint(ctx, processed, total);
               }
             }
           })
@@ -1139,11 +1659,13 @@ export class SyncEngine {
           await ctx.queue.waitAll();
         }
 
+        this.manifest.setRemoteBasePath(cleanBase);
         this.manifest.updateLastSyncTime();
         await this.manifest.save();
 
-        settings.lastSyncTime = Date.now();
-        await this.saveSettings(settings);
+        const latestSettings = this.getSettings();
+        latestSettings.lastSyncTime = Date.now();
+        await this.saveSettings(latestSettings);
 
         this.setState("idle", t("migration.stateDone"));
         const summary = t("migration.summary", { processed, total, skipped, errors });
@@ -1164,11 +1686,22 @@ export class SyncEngine {
       } finally {
         ctx.queue.clear();
         if (!ctx.bridgeDead && this.manifest.isDirty()) {
+          this.manifest.setRemoteBasePath(cleanBase);
           this.manifest.updateLastSyncTime();
-          await this.manifest.save();
+          try {
+            await this.manifest.save();
+          } catch (saveErr: unknown) {
+            const detail = sanitizeErrorMessage(
+              saveErr instanceof Error ? saveErr.message : String(saveErr)
+            );
+            this.addLog("error", t("engine.manifestSaveFailed", { detail }));
+          }
         }
         if (this.activeRunId === runId) {
           this.activeRunId = null;
+        }
+        if (this.activeCtx === ctx) {
+          this.activeCtx = null;
         }
       }
     } finally {
@@ -1176,7 +1709,10 @@ export class SyncEngine {
     }
   }
 
-  private async scanLocalFiles(ctx: SyncRunContext): Promise<Map<string, LocalFileInfo>> {
+  private async scanLocalFiles(
+    ctx: SyncRunContext,
+    settings: BaiduSyncSettings
+  ): Promise<Map<string, LocalFileInfo>> {
     const result = new Map<string, LocalFileInfo>();
     const visitedDirs = new Set<string>();
 
@@ -1190,12 +1726,13 @@ export class SyncEngine {
       const list = await ctx.list(normDir);
 
       for (const file of list.files) {
-        if (this.filter.shouldIgnore(file)) {
+        if (this.filter.shouldIgnore(file, false)) {
           continue;
         }
         const stat = await ctx.statFast(file);
         if (stat && stat.type === "file") {
-          result.set(file, {
+          const canonicalKey = file.normalize("NFC");
+          result.set(canonicalKey, {
             path: file,
             mtime: stat.mtime,
             size: stat.size
@@ -1204,7 +1741,7 @@ export class SyncEngine {
       }
 
       for (const folder of list.folders) {
-        if (this.filter.shouldIgnore(folder)) {
+        if (this.filter.shouldIgnore(folder, true)) {
           continue;
         }
         await scanDirectory(folder);
@@ -1215,7 +1752,6 @@ export class SyncEngine {
     await scanDirectory("");
 
     // Scan config directory only if enabled and not already visited during root scan
-    const settings = this.getSettings();
     const configDir = this.vault.configDir.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
     if (
       settings.syncObsidianConfig &&
@@ -1229,25 +1765,26 @@ export class SyncEngine {
     return result;
   }
 
-  private async scanRemoteFiles(remoteBasePath: string): Promise<Map<string, RemoteFileInfo>> {
+  private async scanRemoteFiles(
+    cleanBase: string
+  ): Promise<{ files: Map<string, RemoteFileInfo>; caseCollisions: string[][] }> {
     const result = new Map<string, RemoteFileInfo>();
-    const cleanBase = normalizeRemoteBase(remoteBasePath);
-    const listRoot = cleanBase || "/";
-    const expectedPrefix = cleanBase ? `${cleanBase}/` : "/";
+    const expectedPrefix = `${cleanBase}/`;
 
-    const items = await this.client.listAll(listRoot);
+    const items = await this.client.listAll(cleanBase);
 
     for (const item of items) {
       if (item.isdir === 1) {
         continue;
       }
 
-      if (!item.path.startsWith(expectedPrefix)) {
+      const normalizedItemPath = item.path.normalize("NFC");
+      if (!normalizedItemPath.startsWith(expectedPrefix)) {
         continue;
       }
 
-      const relativePath = item.path.slice(expectedPrefix.length);
-      if (!relativePath || this.filter.shouldIgnore(relativePath)) {
+      const relativePath = normalizedItemPath.slice(expectedPrefix.length);
+      if (!relativePath || this.filter.shouldIgnore(relativePath, false)) {
         continue;
       }
 
@@ -1261,6 +1798,29 @@ export class SyncEngine {
       });
     }
 
-    return result;
+    // Detect remote files whose paths differ ONLY by letter case (e.g. Note.md vs note.md)
+    // to prevent silent clobbering on case-insensitive macOS/Windows/iOS filesystems.
+    const caseGroups = new Map<string, string[]>();
+    for (const key of result.keys()) {
+      const lower = key.toLowerCase();
+      const group = caseGroups.get(lower);
+      if (group) {
+        group.push(key);
+      } else {
+        caseGroups.set(lower, [key]);
+      }
+    }
+
+    const caseCollisions: string[][] = [];
+    for (const group of caseGroups.values()) {
+      if (group.length >= 2) {
+        caseCollisions.push(group);
+        for (const key of group) {
+          result.delete(key);
+        }
+      }
+    }
+
+    return { files: result, caseCollisions };
   }
 }

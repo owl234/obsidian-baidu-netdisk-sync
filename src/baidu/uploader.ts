@@ -2,6 +2,7 @@ import { BaiduClient } from "./client";
 import { md5 } from "../crypto/md5";
 import { encryptData } from "../crypto/e2ee";
 import { BaiduCreateResponse } from "./types";
+import { t } from "../i18n";
 
 const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB slice size for Baidu PCS
 const RAPID_SLICE_SIZE = 256 * 1024; // First 256KB used for Baidu slice-md5
@@ -23,7 +24,10 @@ export class BaiduUploader {
     let payload = fileBuffer;
 
     // Optional End-to-End Encryption (v2: cached master key + per-file HKDF)
-    if (options.enableE2EE && options.e2eePassword) {
+    if (options.enableE2EE) {
+      if (!options.e2eePassword) {
+        throw new Error(t("e2ee.missingPasswordUpload"));
+      }
       payload = await encryptData(payload, options.e2eePassword);
     }
 
@@ -66,13 +70,21 @@ export class BaiduUploader {
         path: info.path || remotePath,
         size: info.size ?? totalSize,
         ctime: info.ctime ?? Math.floor(Date.now() / 1000),
-        mtime: info.mtime ?? Math.floor(Date.now() / 1000),
+        mtime: info.mtime ?? info.server_mtime ?? Math.floor(Date.now() / 1000),
         isdir: info.isdir ?? 0
       };
     }
 
     // Step 2: Upload Slices (only parts requested by server)
     const uploadId = precreateRes.uploadid;
+    if (!uploadId) {
+      throw new Error(
+        t("client.precreateApiError", {
+          errno: String(precreateRes.errno ?? "unknown"),
+          detail: "missing uploadid"
+        })
+      );
+    }
     const neededParts =
       precreateRes.block_list && Array.isArray(precreateRes.block_list)
         ? precreateRes.block_list
