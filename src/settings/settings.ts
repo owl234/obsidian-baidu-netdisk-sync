@@ -27,6 +27,10 @@ export interface BaiduSyncSettings {
   // Concurrency and network safety
   concurrency: number; // 1 to 5, default 3
   maxFileSizeMB: number; // 0 disables size limit, default 100
+  staleSyncThresholdDays: number; // 0 disables stale-device guard, default 30
+
+  // Local device identity (never exported/overwritten during pairing)
+  deviceId: string;
 
   // E2EE
   enableE2EE: boolean;
@@ -66,6 +70,9 @@ export const DEFAULT_SETTINGS: BaiduSyncSettings = {
 
   concurrency: 3,
   maxFileSizeMB: 100,
+  staleSyncThresholdDays: 30,
+
+  deviceId: "",
 
   enableE2EE: false,
   e2eePassword: "",

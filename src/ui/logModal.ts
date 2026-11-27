@@ -10,16 +10,26 @@ export class SyncLogModal extends Modal {
   private statusDescEl: HTMLElement | null = null;
   private syncBtn: ButtonComponent | null = null;
   private forceDeleteBtn: ButtonComponent | null = null;
+  private trustCloudBtn: ButtonComponent | null = null;
+  private mergeUploadBtn: ButtonComponent | null = null;
   private resetBaselineBtn: ButtonComponent | null = null;
   private forceDeleteArmed = false;
+  private trustCloudArmed = false;
+  private mergeUploadArmed = false;
   private resetBaselineArmed = false;
   private forceDeleteTimer: number | null = null;
+  private trustCloudTimer: number | null = null;
+  private mergeUploadTimer: number | null = null;
   private resetBaselineTimer: number | null = null;
   private lastRecoverySignature = "";
   private unsubscribeLog?: () => void;
   private unsubscribeState?: () => void;
 
-  constructor(app: App, private engine: SyncEngine) {
+  constructor(
+    app: App,
+    private engine: SyncEngine,
+    private onCloseCallback?: () => void
+  ) {
     super(app);
   }
 
@@ -78,11 +88,21 @@ export class SyncLogModal extends Modal {
       window.clearTimeout(this.forceDeleteTimer);
       this.forceDeleteTimer = null;
     }
+    if (this.trustCloudTimer !== null) {
+      window.clearTimeout(this.trustCloudTimer);
+      this.trustCloudTimer = null;
+    }
+    if (this.mergeUploadTimer !== null) {
+      window.clearTimeout(this.mergeUploadTimer);
+      this.mergeUploadTimer = null;
+    }
     if (this.resetBaselineTimer !== null) {
       window.clearTimeout(this.resetBaselineTimer);
       this.resetBaselineTimer = null;
     }
     this.forceDeleteArmed = false;
+    this.trustCloudArmed = false;
+    this.mergeUploadArmed = false;
     this.resetBaselineArmed = false;
   }
 
@@ -92,7 +112,9 @@ export class SyncLogModal extends Modal {
 
     const showForceDelete = this.engine.wasLastRunMassDeleteAborted();
     const showCorruptedHighlight = this.engine.wasLastRunManifestCorrupted();
-    const signature = `${showForceDelete}:${showCorruptedHighlight}`;
+    const showStaleGuard = this.engine.wasLastRunStaleGuardAborted();
+    const staleInfo = showStaleGuard ? this.engine.getLastStaleGuardInfo() : null;
+    const signature = `${showForceDelete}:${showCorruptedHighlight}:${showStaleGuard}:${staleInfo?.reason ?? ""}:${staleInfo?.uploadCount ?? 0}`;
     if (!force && signature === this.lastRecoverySignature) {
       return;
     }
@@ -100,15 +122,95 @@ export class SyncLogModal extends Modal {
 
     this.clearArmTimers();
     this.forceDeleteBtn = null;
+    this.trustCloudBtn = null;
+    this.mergeUploadBtn = null;
     this.resetBaselineBtn = null;
     container.empty();
 
     const isActive = this.engine.isSyncing();
 
-    if (showForceDelete || showCorruptedHighlight) {
+    if (showForceDelete || showCorruptedHighlight || showStaleGuard) {
       container.addClass("baidu-sync-warning-box");
     } else {
       container.removeClass("baidu-sync-warning-box");
+    }
+
+    if (showStaleGuard && staleInfo) {
+      const staleDesc =
+        staleInfo.reason === "empty-baseline"
+          ? t("modal.log.staleGuardDescEmpty", {
+              uploadCount: staleInfo.uploadCount,
+              remoteCount: staleInfo.remoteCount
+            })
+          : t("modal.log.staleGuardDescOffline", {
+              days: staleInfo.staleDays,
+              uploadCount: staleInfo.uploadCount
+            });
+
+      new Setting(container)
+        .setName(t("modal.log.staleGuardName"))
+        .setDesc(staleDesc)
+        .addButton((btn) => {
+          this.trustCloudBtn = btn;
+          btn.buttonEl.addClass("mod-warning");
+          btn
+            .setButtonText(t("modal.log.trustCloudBtn"))
+            .setDisabled(isActive)
+            .onClick(async () => {
+              if (!this.trustCloudArmed) {
+                this.trustCloudArmed = true;
+                btn.setButtonText(t("modal.log.trustCloudConfirmBtn"));
+                this.trustCloudTimer = window.setTimeout(() => {
+                  this.trustCloudArmed = false;
+                  this.trustCloudTimer = null;
+                  if (this.trustCloudBtn) {
+                    this.trustCloudBtn.setButtonText(t("modal.log.trustCloudBtn"));
+                  }
+                }, CONFIRM_ARM_TIMEOUT_MS);
+                return;
+              }
+
+              this.clearArmTimers();
+              btn.setDisabled(true);
+              btn.setButtonText(t("modal.log.syncingBtn"));
+              try {
+                await this.engine.startSync(false, { staleResolution: "trust-cloud" });
+              } finally {
+                this.renderRecoveryControls(true);
+                this.applyState(this.engine.getState(), this.engine.getLastStatusMessage());
+              }
+            });
+        })
+        .addButton((btn) => {
+          this.mergeUploadBtn = btn;
+          btn
+            .setButtonText(t("modal.log.mergeUploadBtn"))
+            .setDisabled(isActive)
+            .onClick(async () => {
+              if (!this.mergeUploadArmed) {
+                this.mergeUploadArmed = true;
+                btn.setButtonText(t("modal.log.mergeUploadConfirmBtn"));
+                this.mergeUploadTimer = window.setTimeout(() => {
+                  this.mergeUploadArmed = false;
+                  this.mergeUploadTimer = null;
+                  if (this.mergeUploadBtn) {
+                    this.mergeUploadBtn.setButtonText(t("modal.log.mergeUploadBtn"));
+                  }
+                }, CONFIRM_ARM_TIMEOUT_MS);
+                return;
+              }
+
+              this.clearArmTimers();
+              btn.setDisabled(true);
+              btn.setButtonText(t("modal.log.syncingBtn"));
+              try {
+                await this.engine.startSync(false, { staleResolution: "merge-upload" });
+              } finally {
+                this.renderRecoveryControls(true);
+                this.applyState(this.engine.getState(), this.engine.getLastStatusMessage());
+              }
+            });
+        });
     }
 
     if (showForceDelete) {
@@ -198,6 +300,12 @@ export class SyncLogModal extends Modal {
     if (this.forceDeleteBtn) {
       this.forceDeleteBtn.setDisabled(isActive);
     }
+    if (this.trustCloudBtn) {
+      this.trustCloudBtn.setDisabled(isActive);
+    }
+    if (this.mergeUploadBtn) {
+      this.mergeUploadBtn.setDisabled(isActive);
+    }
     if (this.resetBaselineBtn) {
       this.resetBaselineBtn.setDisabled(isActive);
     }
@@ -275,10 +383,13 @@ export class SyncLogModal extends Modal {
     this.statusDescEl = null;
     this.syncBtn = null;
     this.forceDeleteBtn = null;
+    this.trustCloudBtn = null;
+    this.mergeUploadBtn = null;
     this.resetBaselineBtn = null;
     this.lastRecoverySignature = "";
 
     const { contentEl } = this;
     contentEl.empty();
+    this.onCloseCallback?.();
   }
 }

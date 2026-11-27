@@ -1,4 +1,5 @@
 import { ManifestItem } from "./manifest";
+import { TombstoneEntry } from "./tombstone";
 import { ConflictStrategy } from "../settings/settings";
 import { t } from "../i18n";
 
@@ -6,6 +7,7 @@ export type SyncActionType =
   | "UPLOAD"
   | "DOWNLOAD"
   | "CONFLICT"
+  | "DELETE_CONFLICT"
   | "UPDATE_MANIFEST"
   | "DELETE_LOCAL"
   | "DELETE_REMOTE"
@@ -34,14 +36,18 @@ export interface SyncPlanItem {
   action: SyncActionType;
   reason: string;
   winner?: "local" | "remote";
+  tombstoneVerified?: boolean;
   local?: LocalFileInfo;
   remote?: RemoteFileInfo;
   manifest?: ManifestItem;
+  tombstone?: TombstoneEntry;
 }
 
 export interface SyncPlanOptions {
   conflictStrategy?: ConflictStrategy;
   enableE2EE?: boolean;
+  tombstones?: Map<string, TombstoneEntry>;
+  currentDeviceId?: string;
 }
 
 function pad2(n: number): string {
@@ -82,6 +88,34 @@ function isPlaintextIdentical(
   return local.md5.toLowerCase() === remote.md5.toLowerCase();
 }
 
+export function getBaselinePlainMd5(manifest: ManifestItem, enableE2EE: boolean): string | undefined {
+  if (manifest.localMd5) {
+    return manifest.localMd5.toLowerCase();
+  }
+  if (!enableE2EE && manifest.md5) {
+    return manifest.md5.toLowerCase();
+  }
+  return undefined;
+}
+
+function isLocalUnchangedAgainstManifest(
+  local: LocalFileInfo,
+  manifest: ManifestItem,
+  enableE2EE: boolean
+): boolean {
+  if (local.size !== manifest.size) {
+    return false;
+  }
+  if (Math.abs(local.mtime - manifest.mtime) <= 1000) {
+    return true;
+  }
+  const baselineMd5 = getBaselinePlainMd5(manifest, enableE2EE);
+  if (baselineMd5 && local.md5) {
+    return local.md5.toLowerCase() === baselineMd5;
+  }
+  return false;
+}
+
 export class SyncPlanner {
   static plan(
     localFiles: Map<string, LocalFileInfo>,
@@ -92,6 +126,8 @@ export class SyncPlanner {
   ): SyncPlanItem[] {
     const conflictStrategy: ConflictStrategy = options.conflictStrategy ?? "copy";
     const enableE2EE = options.enableE2EE ?? false;
+    const tombstones = options.tombstones;
+    const currentDeviceId = options.currentDeviceId;
 
     const plans: SyncPlanItem[] = [];
     const allPaths = new Set<string>([
@@ -159,8 +195,7 @@ export class SyncPlanner {
         }
 
         // With manifest
-        const localChanged =
-          Math.abs(local.mtime - manifest.mtime) > 1000 || local.size !== manifest.size;
+        const localChanged = !isLocalUnchangedAgainstManifest(local, manifest, enableE2EE);
         const expectedRemoteSize =
           manifest.remoteSize !== undefined ? manifest.remoteSize : manifest.size;
         const fsIdChanged =
@@ -248,35 +283,126 @@ export class SyncPlanner {
 
       // Case 2: Only local exists
       if (local && !remote) {
+        const tombstone = tombstones?.get(path);
+        const hashMatchesTombstone = Boolean(
+          tombstone?.deletedHash &&
+            local.md5 &&
+            local.md5.toLowerCase() === tombstone.deletedHash.toLowerCase()
+        );
+        const isSameDeviceRestore = Boolean(
+          tombstone &&
+            currentDeviceId &&
+            tombstone.deviceId === currentDeviceId &&
+            local.mtime > tombstone.deletedAt + 1000
+        );
+
         if (!manifest) {
-          plans.push({
-            path,
-            remotePath,
-            action: "UPLOAD",
-            reason: t("plan.localAdded"),
-            local
-          });
+          if (tombstone && !isSameDeviceRestore) {
+            if (hashMatchesTombstone) {
+              plans.push({
+                path,
+                remotePath,
+                action: "DELETE_LOCAL",
+                tombstoneVerified: true,
+                reason: t("plan.remoteTombstoneMatched"),
+                local,
+                tombstone
+              });
+            } else if (local.mtime <= tombstone.deletedAt + 1000) {
+              plans.push({
+                path,
+                remotePath,
+                action: "DELETE_LOCAL",
+                tombstoneVerified: true,
+                reason: t("plan.remoteTombstoneOlderLocal"),
+                local,
+                tombstone
+              });
+            } else {
+              plans.push({
+                path,
+                remotePath,
+                action: "UPLOAD",
+                reason: t("plan.recreatedAfterDelete"),
+                local,
+                tombstone
+              });
+            }
+          } else if (tombstone && isSameDeviceRestore) {
+            plans.push({
+              path,
+              remotePath,
+              action: "UPLOAD",
+              reason: t("plan.recreatedAfterDelete"),
+              local,
+              tombstone
+            });
+          } else {
+            plans.push({
+              path,
+              remotePath,
+              action: "UPLOAD",
+              reason: t("plan.localAdded"),
+              local
+            });
+          }
         } else {
-          // Remote was deleted
-          const localChanged =
-            Math.abs(local.mtime - manifest.mtime) > 1000 || local.size !== manifest.size;
-          if (localChanged) {
+          // Remote was deleted while this device still had a baseline entry
+          const localUnchanged = isLocalUnchangedAgainstManifest(local, manifest, enableE2EE);
+          if (localUnchanged) {
+            plans.push({
+              path,
+              remotePath,
+              action: "DELETE_LOCAL",
+              tombstoneVerified: Boolean(tombstone),
+              reason: tombstone ? t("plan.remoteTombstoneMatched") : t("plan.remoteDeleted"),
+              local,
+              manifest,
+              tombstone
+            });
+          } else if (hashMatchesTombstone && !isSameDeviceRestore) {
+            // Even if local manifest lagged behind disk (e.g. external copy), local content matches the exact deleted version
+            plans.push({
+              path,
+              remotePath,
+              action: "DELETE_LOCAL",
+              tombstoneVerified: true,
+              reason: t("plan.remoteTombstoneMatched"),
+              local,
+              manifest,
+              tombstone
+            });
+          } else if (conflictStrategy === "copy") {
+            plans.push({
+              path,
+              remotePath,
+              action: "DELETE_CONFLICT",
+              tombstoneVerified: Boolean(tombstone),
+              reason: t("plan.remoteDeletedLocalModifiedConflict"),
+              local,
+              manifest,
+              tombstone
+            });
+          } else if (tombstone && local.mtime <= tombstone.deletedAt + 1000) {
+            plans.push({
+              path,
+              remotePath,
+              action: "DELETE_LOCAL",
+              tombstoneVerified: true,
+              reason: t("plan.remoteDeletedLww"),
+              local,
+              manifest,
+              tombstone
+            });
+          } else {
             plans.push({
               path,
               remotePath,
               action: "UPLOAD",
               reason: t("plan.remoteDeletedLocalModified"),
               local,
-              manifest
-            });
-          } else {
-            plans.push({
-              path,
-              remotePath,
-              action: "DELETE_LOCAL",
-              reason: t("plan.remoteDeleted"),
-              local,
-              manifest
+              manifest,
+              tombstone
             });
           }
         }

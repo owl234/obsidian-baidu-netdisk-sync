@@ -372,6 +372,20 @@ export class BaiduSyncSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName(t("settings.staleSyncThresholdDays.name"))
+      .setDesc(t("settings.staleSyncThresholdDays.desc"))
+      .addText((text) =>
+        text
+          .setPlaceholder("30")
+          .setValue(String(this.plugin.settings.staleSyncThresholdDays ?? 30))
+          .onChange(async (val) => {
+            const num = parseInt(val, 10);
+            this.plugin.settings.staleSyncThresholdDays = isNaN(num) ? 30 : Math.max(0, num);
+            await this.plugin.saveSettings();
+          })
+      );
+
     // Section 7: End-to-End Encryption
     new Setting(containerEl).setName(t("settings.sec7.heading")).setHeading();
 

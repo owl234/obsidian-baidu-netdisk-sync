@@ -203,6 +203,9 @@ export class ImportConfigModal extends Modal {
             if (typeof config.maxFileSizeMB === "number") {
               this.plugin.settings.maxFileSizeMB = config.maxFileSizeMB;
             }
+            if (typeof config.staleSyncThresholdDays === "number") {
+              this.plugin.settings.staleSyncThresholdDays = Math.max(0, config.staleSyncThresholdDays);
+            }
             if (config.enableE2EE !== undefined) {
               this.plugin.settings.enableE2EE = config.enableE2EE;
             }

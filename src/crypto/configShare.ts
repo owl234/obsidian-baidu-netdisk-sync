@@ -16,6 +16,7 @@ export interface SharedSyncConfig {
   ignoredPatterns: string;
   concurrency: number;
   maxFileSizeMB?: number;
+  staleSyncThresholdDays?: number;
   enableE2EE: boolean;
   e2eePassword?: string;
 }
@@ -80,6 +81,7 @@ export async function exportEncryptedConfig(
     ignoredPatterns: settings.ignoredPatterns,
     concurrency: settings.concurrency,
     maxFileSizeMB: settings.maxFileSizeMB,
+    staleSyncThresholdDays: settings.staleSyncThresholdDays,
     enableE2EE: settings.enableE2EE,
     e2eePassword: settings.e2eePassword
   };

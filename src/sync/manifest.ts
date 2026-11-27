@@ -13,7 +13,8 @@ export interface ManifestItem {
   remotePath: string;     // Remote absolute path, e.g. "/apps/obsidian_vault/Folder/Note.md"
   mtime: number;          // Local last modified time in milliseconds
   remoteMtime: number;    // Remote server_mtime in milliseconds
-  md5: string;            // File MD5
+  md5: string;            // Remote file MD5 (ciphertext MD5 under E2EE)
+  localMd5?: string;      // Local plaintext file MD5 (for both plaintext & E2EE)
   size: number;           // Local file size in bytes
   remoteSize?: number;    // Remote file size in bytes (with encryption overhead)
   fsId?: string | number; // Baidu Netdisk fs_id

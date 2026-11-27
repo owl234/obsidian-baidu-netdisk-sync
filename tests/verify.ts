@@ -12,6 +12,14 @@ import { SyncPlanner, LocalFileInfo, RemoteFileInfo, buildConflictPath } from ".
 import { SyncFilter, globToRegex } from "../src/sync/filter";
 import { AsyncQueue, QueueCancelledError } from "../src/sync/queue";
 import { ManifestManager, ManifestStorageAdapter } from "../src/sync/manifest";
+import {
+  REMOTE_TOMBSTONE_DIR_REL,
+  TombstoneManager,
+  buildRemoteTombstonePath,
+  extractTombstoneDeviceId,
+  generateDeviceId,
+  isValidDeviceId
+} from "../src/sync/tombstone";
 import { SyncEngine, VaultSyncBridge, normalizeAndValidateRemoteBasePath } from "../src/sync/engine";
 import { OperationTimeoutError } from "../src/sync/timeout";
 import { BaiduSyncSettings, DEFAULT_SETTINGS } from "../src/settings/settings";
@@ -2445,6 +2453,776 @@ async function testDeepAuditProtectionsSuite() {
   console.log("   All deep-audit P0/P1 protection tests passed!");
 }
 
+async function testStaleDeviceDeletionDefenseSuite() {
+  console.log(
+    "-> Testing 3-layer stale-device deletion defense (L1 per-device CRDT tombstones + E2EE/fail-closed/GC/retry, L2 plaintext localMd5 anti-mtime-drift, Case A/B/C/D DELETE_CONFLICT, circuit-breaker synergy, L3 stale/empty-baseline guard & trust-cloud/merge-upload)..."
+  );
+
+  // Full stateful in-memory Baidu Cloud simulator supporting multiple devices, E2EE, uploads, downloads, deletes, and shard tracking
+  function createMockCloud() {
+    let nextFsId = 100001;
+    let clockSec = Math.floor(Date.now() / 1000);
+    const files = new Map<
+      string,
+      { fsId: string; path: string; data: ArrayBuffer; mtimeSec: number; md5Hex: string }
+    >();
+    const pendingUploads = new Map<string, { path: string; slices: Map<number, ArrayBuffer> }>();
+    const downloadedPaths: string[] = [];
+    const uploadedPaths: string[] = [];
+    const deletedPaths: string[] = [];
+    let failTombstoneUploads = false;
+
+    const putRaw = (remotePath: string, data: ArrayBuffer, mtimeSec?: number) => {
+      const m = mtimeSec ?? ++clockSec;
+      const copy = data.slice(0);
+      files.set(remotePath, {
+        fsId: String(nextFsId++),
+        path: remotePath,
+        data: copy,
+        mtimeSec: m,
+        md5Hex: md5(copy)
+      });
+    };
+
+    const deleteRaw = (remotePath: string) => {
+      files.delete(remotePath);
+    };
+
+    const http: HttpRequestFn = async (param) => {
+      if (param.url.includes("method=listall")) {
+        const u = new URL(param.url);
+        const base = u.searchParams.get("path") || "";
+        const prefix = `${base}/`;
+        const list = [];
+        for (const f of files.values()) {
+          if (f.path.startsWith(prefix)) {
+            list.push({
+              fs_id: f.fsId,
+              path: f.path,
+              server_filename: f.path.slice(f.path.lastIndexOf("/") + 1),
+              size: f.data.byteLength,
+              isdir: 0,
+              server_mtime: f.mtimeSec,
+              server_ctime: f.mtimeSec,
+              md5: f.md5Hex
+            });
+          }
+        }
+        return makeJsonResponse({ errno: 0, has_more: 0, list });
+      }
+
+      if (param.url.includes("method=filemetas")) {
+        const u = new URL(param.url);
+        const fsids = JSON.parse(u.searchParams.get("fsids") || "[]") as Array<string | number>;
+        const idSet = new Set(fsids.map(String));
+        const list = [];
+        for (const f of files.values()) {
+          if (idSet.has(f.fsId)) {
+            list.push({
+              fs_id: f.fsId,
+              path: f.path,
+              server_filename: f.path.slice(f.path.lastIndexOf("/") + 1),
+              size: f.data.byteLength,
+              isdir: 0,
+              category: 6,
+              md5: f.md5Hex,
+              dlink: `https://d.pcs.baidu.com/mock-dl/${encodeURIComponent(f.fsId)}`
+            });
+          }
+        }
+        return makeJsonResponse({ errno: 0, list });
+      }
+
+      if (param.url.startsWith("https://d.pcs.baidu.com/mock-dl/")) {
+        const afterPrefix = param.url.slice("https://d.pcs.baidu.com/mock-dl/".length);
+        const fsId = decodeURIComponent(afterPrefix.split("?")[0]);
+        for (const f of files.values()) {
+          if (f.fsId === fsId) {
+            downloadedPaths.push(f.path);
+            return makeBinaryResponse(f.data.slice(0));
+          }
+        }
+        return makeJsonResponse({ error_code: 31066, error_msg: "not found" }, 404);
+      }
+
+      if (param.url.includes("method=precreate")) {
+        const params = new URLSearchParams(String(param.body || ""));
+        const p = params.get("path") || "";
+        if (failTombstoneUploads && p.includes("/tombstones/")) {
+          return makeJsonResponse({ errno: 31034, errmsg: "simulated tombstone failure" }, 500);
+        }
+        const uploadid = `up-${nextFsId++}`;
+        const blockList = JSON.parse(params.get("block_list") || "[]") as string[];
+        pendingUploads.set(uploadid, { path: p, slices: new Map() });
+        return makeJsonResponse({
+          errno: 0,
+          path: p,
+          uploadid,
+          return_type: 1,
+          block_list: blockList.map((_, idx) => idx)
+        });
+      }
+
+      if (param.url.includes("superfile2?method=upload")) {
+        const u = new URL(param.url);
+        const uploadid = u.searchParams.get("uploadid") || "";
+        const partseq = Number(u.searchParams.get("partseq") || "0");
+        const entry = pendingUploads.get(uploadid);
+        assert.ok(entry, `Missing pending upload ${uploadid}`);
+        // Extract raw payload from multipart form-data body
+        const bodyBuf = param.body as ArrayBuffer;
+        const bodyBytes = new Uint8Array(bodyBuf);
+        const headerEndSeq = [13, 10, 13, 10]; // \r\n\r\n
+        let dataStart = -1;
+        for (let i = 0; i <= bodyBytes.length - 4; i++) {
+          if (
+            bodyBytes[i] === headerEndSeq[0] &&
+            bodyBytes[i + 1] === headerEndSeq[1] &&
+            bodyBytes[i + 2] === headerEndSeq[2] &&
+            bodyBytes[i + 3] === headerEndSeq[3]
+          ) {
+            dataStart = i + 4;
+            break;
+          }
+        }
+        assert.ok(dataStart >= 0, "Multipart header delimiter not found");
+        // Find trailing \r\n--boundary
+        let dataEnd = bodyBytes.length;
+        for (let i = bodyBytes.length - 4; i >= dataStart; i--) {
+          if (bodyBytes[i] === 13 && bodyBytes[i + 1] === 10 && bodyBytes[i + 2] === 45 && bodyBytes[i + 3] === 45) {
+            dataEnd = i;
+            break;
+          }
+        }
+        const rawSlice = bodyBytes.slice(dataStart, dataEnd).buffer;
+        entry.slices.set(partseq, rawSlice);
+        return makeJsonResponse({ md5: md5(rawSlice) });
+      }
+
+      if (param.url.includes("method=create")) {
+        const params = new URLSearchParams(String(param.body || ""));
+        const p = params.get("path") || "";
+        const uploadid = params.get("uploadid") || "";
+        const entry = pendingUploads.get(uploadid);
+        assert.ok(entry, `Missing pending upload for create ${uploadid}`);
+        const ordered = Array.from(entry.slices.entries()).sort((a, b) => a[0] - b[0]);
+        const totalLen = ordered.reduce((acc, [, b]) => acc + b.byteLength, 0);
+        const combined = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const [, buf] of ordered) {
+          combined.set(new Uint8Array(buf), offset);
+          offset += buf.byteLength;
+        }
+        pendingUploads.delete(uploadid);
+        const mtimeSec = ++clockSec;
+        const fsId = String(nextFsId++);
+        const finalBuf = combined.buffer;
+        const md5Hex = md5(finalBuf);
+        files.set(p, { fsId, path: p, data: finalBuf, mtimeSec, md5Hex });
+        uploadedPaths.push(p);
+        return makeJsonResponse({
+          errno: 0,
+          fs_id: fsId,
+          md5: md5Hex,
+          server_filename: p.slice(p.lastIndexOf("/") + 1),
+          category: 6,
+          path: p,
+          size: finalBuf.byteLength,
+          ctime: mtimeSec,
+          mtime: mtimeSec,
+          isdir: 0
+        });
+      }
+
+      if (param.url.includes("opera=delete")) {
+        const params = new URLSearchParams(String(param.body || ""));
+        const list = JSON.parse(params.get("filelist") || "[]") as string[];
+        for (const p of list) {
+          files.delete(p);
+          deletedPaths.push(p);
+        }
+        return makeJsonResponse({ errno: 0 });
+      }
+
+      throw new Error(`Unexpected mock cloud URL: ${param.url}`);
+    };
+
+    return {
+      files,
+      downloadedPaths,
+      uploadedPaths,
+      deletedPaths,
+      setFailTombstoneUploads: (v: boolean) => {
+        failTombstoneUploads = v;
+      },
+      putRaw,
+      deleteRaw,
+      http
+    };
+  }
+
+  const makeDevice = (
+    cloud: ReturnType<typeof createMockCloud>,
+    deviceId: string,
+    overrides: Partial<BaiduSyncSettings> = {},
+    engineOpts: {
+      tombstoneRetentionMs?: number;
+      tombstoneRetiredShardGraceMs?: number;
+      tombstoneMaxEntriesPerDevice?: number;
+      e2eeMd5BackfillMaxFiles?: number;
+      e2eeMd5BackfillMaxBytes?: number;
+    } = {}
+  ) => {
+    const vault = createMemoryVault(".obsidian");
+    const pluginDir = ".obsidian/plugins/baidu-netdisk-sync";
+    const manifestMgr = new ManifestManager(vault, `${pluginDir}/sync_manifest.json`);
+    const tombstoneMgr = new TombstoneManager(vault, `${pluginDir}/tombstone_cache.json`, {
+      retentionMs: engineOpts.tombstoneRetentionMs,
+      retiredShardGraceMs: engineOpts.tombstoneRetiredShardGraceMs,
+      maxEntriesPerDevice: engineOpts.tombstoneMaxEntriesPerDevice
+    });
+    let settings: BaiduSyncSettings = {
+      ...DEFAULT_SETTINGS,
+      appKey: "k",
+      appSecret: "s",
+      accessToken: "VALID_TOK",
+      refreshToken: "REF",
+      tokenExpiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      syncObsidianConfig: false,
+      deviceId,
+      ...overrides
+    };
+    const oauth = new BaiduOAuthManager(() => settings, async (s) => { settings = s; }, cloud.http);
+    const client = new BaiduClient(oauth, cloud.http, { delayFn: zeroDelay });
+    const engine = new SyncEngine(
+      vault,
+      () => settings,
+      async (s) => { settings = s; },
+      client,
+      manifestMgr,
+      pluginDir,
+      {
+        tombstones: tombstoneMgr,
+        e2eeMd5BackfillMaxFiles: engineOpts.e2eeMd5BackfillMaxFiles,
+        e2eeMd5BackfillMaxBytes: engineOpts.e2eeMd5BackfillMaxBytes
+      }
+    );
+    return {
+      vault,
+      manifestMgr,
+      tombstoneMgr,
+      engine,
+      getSettings: () => settings,
+      setSettings: (patch: Partial<BaiduSyncSettings>) => {
+        settings = { ...settings, ...patch };
+      }
+    };
+  };
+
+  // 1. Legacy compatibility & deviceId validation
+  {
+    const id = generateDeviceId();
+    assert.strictEqual(isValidDeviceId(id), true);
+    assert.strictEqual(extractTombstoneDeviceId(`${REMOTE_TOMBSTONE_DIR_REL}/${id}.json`), id);
+    assert.strictEqual(extractTombstoneDeviceId(`${REMOTE_TOMBSTONE_DIR_REL}/../evil.json`), null);
+
+    // Filter must ignore cloud metadata folder, tombstone shard path, and local tombstone cache
+    const filter = new SyncFilter(DEFAULT_SETTINGS, ".obsidian");
+    assert.strictEqual(filter.shouldIgnore(`${REMOTE_TOMBSTONE_DIR_REL}/${id}.json`, false), true);
+    assert.strictEqual(filter.shouldIgnore(".bdsync-meta", true), true);
+    assert.strictEqual(filter.shouldIgnore("tombstone_cache.json", false), true);
+    assert.strictEqual(filter.shouldIgnore("tombstone_cache.json.bak", false), true);
+    // Legacy <= v1.1.4 filter rule: `normalized.includes("/plugins/baidu-netdisk-sync/")`
+    assert.strictEqual(`${REMOTE_TOMBSTONE_DIR_REL}/${id}.json`.includes("/plugins/baidu-netdisk-sync/"), true);
+  }
+
+  // 2. Pairing configShare MUST exclude deviceId and preserve staleSyncThresholdDays
+  {
+    const srcSettings: BaiduSyncSettings = {
+      ...DEFAULT_SETTINGS,
+      appKey: "k",
+      appSecret: "s",
+      accessToken: "tok",
+      refreshToken: "ref",
+      tokenExpiresAt: Date.now() + 100000,
+      deviceId: "dev-aaaaaaaaaaaaaaaaaaaaaaaa",
+      staleSyncThresholdDays: 45
+    };
+    const code = await exportEncryptedConfig(srcSettings, "pin999");
+    const imported = await importEncryptedConfig(code, "pin999");
+    assert.strictEqual(imported.staleSyncThresholdDays, 45);
+    assert.strictEqual("deviceId" in imported, false, "deviceId MUST NEVER be exported in pairing payload");
+  }
+
+  // 3. L1 + L2 full two-device lifecycle:
+  //    - Device A deletes `old.md` -> records cloud tombstone shard
+  //    - Device B loses manifest AND drifts `old.md` mtime into the future -> L1 hash match moves `old.md` to .trash (0 uploads!)
+  //    - Device C still has manifest AND drifts `old.md` mtime by +10 days -> L2 plaintext localMd5 moves `old.md` to .trash!
+  {
+    const cloud = createMockCloud();
+    const devA = makeDevice(cloud, "dev-aaaaaaaaaaaaaaaaaaaaaaaa");
+    const devB = makeDevice(cloud, "dev-bbbbbbbbbbbbbbbbbbbbbbbb");
+    const devC = makeDevice(cloud, "dev-cccccccccccccccccccccccc");
+
+    const baseTime = Date.now() - 60_000;
+    devA.vault.seedFile("old.md", "deprecated note content", baseTime);
+    devA.vault.seedFile("keep.md", "living note content", baseTime);
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+
+    // Device B & C pull initial vault cleanly
+    assert.strictEqual((await devB.engine.startSync(false)).success, true);
+    assert.strictEqual((await devC.engine.startSync(false)).success, true);
+    assert.strictEqual(devB.vault.readText("old.md"), "deprecated note content");
+    assert.ok(devC.manifestMgr.get("old.md")?.localMd5, "Manifest must capture plaintext localMd5 on download");
+
+    // Device A deletes old.md and syncs -> uploads cloud tombstone shard dev-aaaa...json
+    devA.vault.files.delete("old.md");
+    const resDelA = await devA.engine.startSync(false);
+    assert.strictEqual(resDelA.success, true);
+    assert.strictEqual(resDelA.stats.deleted, 1);
+    const shardAPath = buildRemoteTombstonePath("/apps/obsidian_vault", "dev-aaaaaaaaaaaaaaaaaaaaaaaa");
+    assert.ok(cloud.files.has(shardAPath), "Device A must upload its cloud tombstone shard after DELETE_REMOTE");
+
+    // Device B loses manifest completely AND its local old.md mtime drifts into the FUTURE (+1 hour)
+    await devB.engine.resetLocalBaseline();
+    devB.vault.seedFile("old.md", "deprecated note content", Date.now() + 3_600_000);
+    const resB = await devB.engine.startSync(false);
+    assert.strictEqual(resB.success, true, "Device B must not fail or trip stale guard when old.md matches tombstone");
+    assert.strictEqual(resB.stats.uploaded, 0, "Device B MUST NOT resurrect deleted old.md");
+    assert.strictEqual(resB.stats.deleted, 1);
+    assert.strictEqual(devB.vault.files.has("old.md"), false);
+    assert.ok(devB.vault.trashed.includes("old.md"));
+    assert.strictEqual(cloud.files.has("/apps/obsidian_vault/old.md"), false);
+
+    // Steady-state check: running Device B again must download 0 tombstone shards (served from local cache)
+    const dlBefore = cloud.downloadedPaths.length;
+    assert.strictEqual((await devB.engine.startSync(false)).success, true);
+    assert.strictEqual(cloud.downloadedPaths.length, dlBefore, "Steady-state sync must perform 0 extra tombstone downloads");
+
+    // Device C keeps manifest, but OS/FS drifts old.md mtime by +10 days (content unchanged)
+    // Even if we remove the cloud tombstone shard to test pure L2 mtime-drift resistance:
+    cloud.deleteRaw(shardAPath);
+    devC.vault.seedFile("old.md", "deprecated note content", Date.now() + 10 * 86_400_000);
+    const resC = await devC.engine.startSync(false);
+    assert.strictEqual(resC.success, true);
+    assert.strictEqual(resC.stats.uploaded, 0, "L2 localMd5 must prevent mtime-drifted unmodified file from resurrecting");
+    assert.strictEqual(resC.stats.deleted, 1);
+    assert.ok(devC.vault.trashed.includes("old.md"));
+  }
+
+  // 4. Case B (older v1 with missing manifest) & Case C (recreated after deletion + same-device restore)
+  {
+    const cloud = createMockCloud();
+    const devA = makeDevice(cloud, "dev-aaaaaaaaaaaaaaaaaaaaaaaa");
+    const devB = makeDevice(cloud, "dev-bbbbbbbbbbbbbbbbbbbbbbbb");
+
+    const t0 = Date.now() - 120_000;
+    devA.vault.seedFile("evolving.md", "version 1", t0);
+    devA.vault.seedFile("keep.md", "keep", t0);
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+
+    // Device A updates to v2, syncs, then deletes v2 -> tombstone records v2 hash & deletedAt (~now)
+    devA.vault.seedFile("evolving.md", "version 2 edited", Date.now() - 30_000);
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    devA.vault.files.delete("evolving.md");
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+
+    // Case B: Device B has NO manifest and holds older v1 (hash != v2 hash, but mtime t0 <= deletedAt)
+    devB.vault.seedFile("evolving.md", "version 1", t0);
+    devB.vault.seedFile("keep.md", "keep", t0);
+    const resB = await devB.engine.startSync(false);
+    assert.strictEqual(resB.success, true);
+    assert.strictEqual(resB.stats.uploaded, 0, "Older pre-deletion v1 without manifest must NOT resurrect");
+    assert.strictEqual(devB.vault.files.has("evolving.md"), false);
+    assert.ok(devB.vault.trashed.includes("evolving.md"));
+
+    // Case C1: User on Device B intentionally creates a brand new evolving.md AFTER deletion
+    devB.vault.seedFile("evolving.md", "brand new note after deletion", Date.now() + 5_000);
+    const resRecreateB = await devB.engine.startSync(false);
+    assert.strictEqual(resRecreateB.success, true);
+    assert.strictEqual(resRecreateB.stats.uploaded, 1, "Brand new note created after deletion MUST upload");
+    assert.ok(cloud.files.has("/apps/obsidian_vault/evolving.md"));
+
+    // Case C2: Same-device restore — Device A deletes `restore.md`, syncs, then pastes back IDENTICAL content later
+    devA.vault.seedFile("restore.md", "exact same content", Date.now() - 10_000);
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    devA.vault.files.delete("restore.md");
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    assert.strictEqual(cloud.files.has("/apps/obsidian_vault/restore.md"), false);
+
+    devA.vault.seedFile("restore.md", "exact same content", Date.now() + 5_000);
+    const resRestoreA = await devA.engine.startSync(false);
+    assert.strictEqual(resRestoreA.success, true);
+    assert.strictEqual(resRestoreA.stats.uploaded, 1, "Same-device intentional restore after delete MUST upload");
+    assert.ok(cloud.files.has("/apps/obsidian_vault/restore.md"));
+    assert.strictEqual(
+      devA.tombstoneMgr.getMergedTombstones("dev-aaaaaaaaaaaaaaaaaaaaaaaa").has("restore.md"),
+      false,
+      "Uploading restored file on same device must clear its own tombstone entry"
+    );
+  }
+
+  // 5. Case D: Real offline edit vs remote delete (copy -> DELETE_CONFLICT; lww -> timestamp comparison)
+  {
+    const cloud = createMockCloud();
+    const devA = makeDevice(cloud, "dev-aaaaaaaaaaaaaaaaaaaaaaaa", { conflictStrategy: "copy" });
+    const devB = makeDevice(cloud, "dev-bbbbbbbbbbbbbbbbbbbbbbbb", { conflictStrategy: "copy" });
+    const devLww = makeDevice(cloud, "dev-cccccccccccccccccccccccc", { conflictStrategy: "lww" });
+
+    const t0 = Date.now() - 60_000;
+    devA.vault.seedFile("idea.md", "initial draft", t0);
+    devA.vault.seedFile("lww-old.md", "initial lww", t0);
+    devA.vault.seedFile("lww-new.md", "initial lww new", t0);
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    assert.strictEqual((await devB.engine.startSync(false)).success, true);
+    assert.strictEqual((await devLww.engine.startSync(false)).success, true);
+
+    // Device A deletes all 3 files
+    devA.vault.files.delete("idea.md");
+    devA.vault.files.delete("lww-old.md");
+    devA.vault.files.delete("lww-new.md");
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+
+    // Device B genuinely edits idea.md offline under copy strategy -> DELETE_CONFLICT
+    devB.vault.seedFile("idea.md", "offline edited content worth saving!", Date.now() + 2_000);
+    const resB = await devB.engine.startSync(false);
+    assert.strictEqual(resB.success, true);
+    assert.strictEqual(resB.stats.conflicts, 1, "Copy mode delete-modify must create conflict copy");
+    assert.strictEqual(devB.vault.files.has("idea.md"), false, "Original deleted path must be trashed");
+    assert.strictEqual(cloud.files.has("/apps/obsidian_vault/idea.md"), false, "Original deleted path must stay deleted remotely");
+    const conflictFile = Array.from(devB.vault.files.keys()).find((p) => p.startsWith("idea.conflict-"));
+    assert.ok(conflictFile, "Conflict backup copy must exist locally");
+    assert.strictEqual(devB.vault.readText(conflictFile!), "offline edited content worth saving!");
+    assert.ok(cloud.files.has(`/apps/obsidian_vault/${conflictFile!}`), "Conflict backup copy must be uploaded to cloud");
+
+    // Device C (LWW): lww-old edited BEFORE deletion -> trashed; lww-new edited AFTER deletion -> uploaded
+    devLww.vault.seedFile("lww-old.md", "older offline edit", t0 + 10_000);
+    devLww.vault.seedFile("lww-new.md", "newer offline edit", Date.now() + 10_000);
+    const resLww = await devLww.engine.startSync(false);
+    assert.strictEqual(resLww.success, true);
+    assert.strictEqual(devLww.vault.files.has("lww-old.md"), false, "LWW must trash edit older than deletion");
+    assert.strictEqual(cloud.files.has("/apps/obsidian_vault/lww-old.md"), false);
+    assert.ok(cloud.files.has("/apps/obsidian_vault/lww-new.md"), "LWW must upload edit newer than deletion");
+  }
+
+  // 6. E2EE tombstone encryption, Fail-Closed wrong-password guard, and convertVaultToPlaintext
+  {
+    const cloud = createMockCloud();
+    const pass = "E2EE-Tombstone-Secret-2026!";
+    const devA = makeDevice(cloud, "dev-aaaaaaaaaaaaaaaaaaaaaaaa", { enableE2EE: true, e2eePassword: pass });
+    const devB = makeDevice(cloud, "dev-bbbbbbbbbbbbbbbbbbbbbbbb", { enableE2EE: true, e2eePassword: pass });
+
+    devA.vault.seedFile("SecretDiary.md", "my private diary", Date.now() - 30_000);
+    devA.vault.seedFile("KeepSecret.md", "keep this secret", Date.now() - 30_000);
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    assert.strictEqual((await devB.engine.startSync(false)).success, true);
+
+    // Device A deletes SecretDiary.md -> encrypted tombstone shard uploaded
+    devA.vault.files.delete("SecretDiary.md");
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+
+    const shardAPath = buildRemoteTombstonePath("/apps/obsidian_vault", "dev-aaaaaaaaaaaaaaaaaaaaaaaa");
+    const rawShard = cloud.files.get(shardAPath);
+    assert.ok(rawShard, "Encrypted tombstone shard must exist on cloud");
+    assert.strictEqual(getEncryptionVersion(rawShard!.data), 2, "E2EE tombstone shard MUST use E2EE v2 format");
+    assert.strictEqual(
+      new TextDecoder().decode(rawShard!.data).includes("SecretDiary.md"),
+      false,
+      "E2EE tombstone shard MUST NOT leak deleted filenames in plaintext"
+    );
+
+    // Fail-closed test: Device B has WRONG password + wiped manifest -> MUST abort sync and NOT upload SecretDiary.md
+    await devB.engine.resetLocalBaseline();
+    devB.setSettings({ e2eePassword: "WRONG-PASSWORD" });
+    const resWrong = await devB.engine.startSync(false);
+    assert.strictEqual(resWrong.success, false, "Wrong E2EE password on tombstone shard MUST fail-closed");
+    assert.strictEqual(cloud.files.has("/apps/obsidian_vault/SecretDiary.md"), false, "Must NOT resurrect file on tombstone decrypt failure");
+
+    // Restore correct password -> Device B decrypts shard, verifies plaintext MD5, and trashes SecretDiary.md!
+    devB.setSettings({ e2eePassword: pass });
+    const resFixed = await devB.engine.startSync(false);
+    assert.strictEqual(resFixed.success, true);
+    assert.strictEqual(devB.vault.files.has("SecretDiary.md"), false);
+    assert.ok(devB.vault.trashed.includes("SecretDiary.md"));
+
+    // Plaintext migration on Device A must also convert its encrypted tombstone shard to plaintext JSON
+    const migRes = await devA.engine.convertVaultToPlaintext();
+    assert.strictEqual(migRes.success, true);
+    const migratedShard = cloud.files.get(shardAPath);
+    assert.ok(migratedShard);
+    assert.strictEqual(isEncrypted(migratedShard!.data), false, "Plaintext migration must convert own tombstone shard to plaintext");
+    assert.ok(new TextDecoder().decode(migratedShard!.data).includes("SecretDiary.md"));
+  }
+
+  // 7. Mass-Delete Circuit Breaker synergy: tombstone-verified deletes flow smoothly; unverified mass deletes stay blocked
+  {
+    const cloud = createMockCloud();
+    const devA = makeDevice(cloud, "dev-aaaaaaaaaaaaaaaaaaaaaaaa");
+    const devB = makeDevice(cloud, "dev-bbbbbbbbbbbbbbbbbbbbbbbb");
+
+    const t0 = Date.now() - 60_000;
+    for (let i = 1; i <= 15; i++) {
+      devA.vault.seedFile(`note-${i}.md`, `content ${i}`, t0);
+    }
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    assert.strictEqual((await devB.engine.startSync(false)).success, true);
+
+    // Device A gradually deletes 12 of 15 files across 4 normal sessions while Device B sleeps
+    // (3 files per session stays below single-run guard, accumulating 80% total deletions with cloud tombstones!)
+    for (let batch = 0; batch < 4; batch++) {
+      for (let j = 1; j <= 3; j++) {
+        devA.vault.files.delete(`note-${batch * 3 + j}.md`);
+      }
+      assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    }
+
+    // Device B wakes up -> all 12 are tombstone-verified -> flows smoothly into .trash without aborting!
+    const resB = await devB.engine.startSync(false);
+    assert.strictEqual(resB.success, true, "Tombstone-verified bulk deletions must flow smoothly without false circuit-breaker trip");
+    assert.strictEqual(resB.stats.deleted, 12);
+    assert.strictEqual(devB.vault.trashed.length, 12);
+
+    // Contrast: delete 12 files directly on cloud WITHOUT tombstones -> MUST STILL trip circuit breaker!
+    const cloud2 = createMockCloud();
+    const devX = makeDevice(cloud2, "dev-xxxxxxxxxxxxxxxxxxxxxxxx");
+    for (let i = 1; i <= 15; i++) {
+      devX.vault.seedFile(`u-${i}.md`, `content ${i}`, t0);
+    }
+    assert.strictEqual((await devX.engine.startSync(false)).success, true);
+    for (let i = 1; i <= 12; i++) {
+      cloud2.deleteRaw(`/apps/obsidian_vault/u-${i}.md`);
+    }
+    const resUnverified = await devX.engine.startSync(false);
+    assert.strictEqual(resUnverified.success, false);
+    assert.strictEqual(resUnverified.massDeleteAborted, true, "Unverified mass remote deletion without tombstones MUST trip circuit breaker");
+    assert.strictEqual(devX.vault.trashed.length, 0);
+  }
+
+  // 8. Layer 3 Stale-Device & Empty-Baseline Guard + trust-cloud & merge-upload modes
+  {
+    const cloud = createMockCloud();
+    const t0 = Date.now() - 60_000;
+    cloud.putRaw("/apps/obsidian_vault/cloud-active.md", new TextEncoder().encode("active on cloud").slice().buffer);
+
+    // 8a. Empty baseline connecting to populated cloud with unexplained local-only file -> trips staleGuardAborted
+    const devEmpty = makeDevice(cloud, "dev-eeeeeeeeeeeeeeeeeeeeeeee");
+    devEmpty.vault.seedFile("legacy-deleted-before-upgrade.md", "old local leftover", t0);
+    const resBlocked = await devEmpty.engine.startSync(false);
+    assert.strictEqual(resBlocked.success, false);
+    assert.strictEqual(resBlocked.staleGuardAborted, true, "Empty baseline + non-empty cloud + unexplained local file must trip L3 guard");
+    assert.strictEqual(devEmpty.engine.wasLastRunStaleGuardAborted(), true);
+    assert.strictEqual(devEmpty.engine.getLastStaleGuardInfo()?.reason, "empty-baseline");
+    assert.strictEqual(cloud.files.has("/apps/obsidian_vault/legacy-deleted-before-upgrade.md"), false);
+
+    // Resolve via trust-cloud -> moves leftover to .trash and pulls cloud-active.md!
+    const resTrust = await devEmpty.engine.startSync(false, { staleResolution: "trust-cloud" });
+    assert.strictEqual(resTrust.success, true);
+    assert.strictEqual(devEmpty.vault.files.has("legacy-deleted-before-upgrade.md"), false);
+    assert.ok(devEmpty.vault.trashed.includes("legacy-deleted-before-upgrade.md"));
+    assert.strictEqual(devEmpty.vault.readText("cloud-active.md"), "active on cloud");
+    assert.strictEqual(cloud.files.has("/apps/obsidian_vault/legacy-deleted-before-upgrade.md"), false);
+
+    // 8b. Empty baseline resolved via merge-upload -> uploads local-only file
+    const devMerge = makeDevice(cloud, "dev-111111111111111111111111");
+    devMerge.vault.seedFile("intentional-new.md", "keep me!", t0);
+    const resMergeBlocked = await devMerge.engine.startSync(false);
+    assert.strictEqual(resMergeBlocked.staleGuardAborted, true);
+    const resMerge = await devMerge.engine.startSync(false, { staleResolution: "merge-upload" });
+    assert.strictEqual(resMerge.success, true);
+    assert.ok(cloud.files.has("/apps/obsidian_vault/intentional-new.md"));
+
+    // 8c. Stale device (>30 days since lastSyncTime) with unexplained upload + stale local delete -> trust-cloud restores remote & trashes local extra
+    const devStale = makeDevice(cloud, "dev-222222222222222222222222", { staleSyncThresholdDays: 30 });
+    assert.strictEqual((await devStale.engine.startSync(false)).success, true);
+    // Simulate 45 days offline
+    devStale.manifestMgr.updateLastSyncTime(Date.now() - 45 * 86_400_000);
+    await devStale.manifestMgr.save();
+    // Offline device has an unexplained local file AND missing cloud-active.md (would otherwise DELETE_REMOTE!)
+    devStale.vault.seedFile("stale-extra.md", "stale leftover", Date.now());
+    devStale.vault.files.delete("cloud-active.md");
+
+    const resStaleAbort = await devStale.engine.startSync(false);
+    assert.strictEqual(resStaleAbort.staleGuardAborted, true);
+    assert.strictEqual(devStale.engine.getLastStaleGuardInfo()?.reason, "stale-days");
+    assert.ok(cloud.files.has("/apps/obsidian_vault/cloud-active.md"), "Must not delete remote file when stale guard aborts");
+
+    const resStaleTrust = await devStale.engine.startSync(false, { staleResolution: "trust-cloud" });
+    assert.strictEqual(resStaleTrust.success, true);
+    assert.strictEqual(devStale.vault.files.has("stale-extra.md"), false);
+    assert.ok(devStale.vault.trashed.includes("stale-extra.md"));
+    assert.strictEqual(devStale.vault.readText("cloud-active.md"), "active on cloud", "trust-cloud must restore cloud-active.md instead of deleting it remotely");
+    assert.ok(cloud.files.has("/apps/obsidian_vault/cloud-active.md"));
+
+    // 8d. Stale device (>30 days) with 0 unexplained uploads (only tombstoned deletes) -> succeeds seamlessly WITHOUT tripping L3!
+    devStale.manifestMgr.updateLastSyncTime(Date.now() - 45 * 86_400_000);
+    await devStale.manifestMgr.save();
+    const resStaleClean = await devStale.engine.startSync(false);
+    assert.strictEqual(resStaleClean.success, true, "Stale device with 0 unexplained uploads must sync cleanly without blocking");
+    assert.strictEqual(resStaleClean.staleGuardAborted, undefined);
+
+    // 8e. Setting staleSyncThresholdDays = 0 disables offline-day guard
+    devStale.setSettings({ staleSyncThresholdDays: 0 });
+    devStale.manifestMgr.updateLastSyncTime(Date.now() - 90 * 86_400_000);
+    await devStale.manifestMgr.save();
+    devStale.vault.seedFile("disabled-guard-new.md", "allowed", Date.now());
+    const resDisabled = await devStale.engine.startSync(false);
+    assert.strictEqual(resDisabled.success, true);
+    assert.ok(cloud.files.has("/apps/obsidian_vault/disabled-guard-new.md"));
+  }
+
+  // 9. GC pruning (TTL + maxEntriesPerDevice) & pendingUpload transient failure self-healing retry
+  {
+    const cloud = createMockCloud();
+    const devA = makeDevice(
+      cloud,
+      "dev-aaaaaaaaaaaaaaaaaaaaaaaa",
+      {},
+      { tombstoneRetentionMs: 1000, tombstoneMaxEntriesPerDevice: 3 }
+    );
+    const now = Date.now();
+    devA.tombstoneMgr.recordDeletion("expired.md", { deletedAt: now - 5000 });
+    devA.tombstoneMgr.recordDeletion("d1.md", { deletedAt: now - 500 });
+    devA.tombstoneMgr.recordDeletion("d2.md", { deletedAt: now - 400 });
+    devA.tombstoneMgr.recordDeletion("d3.md", { deletedAt: now - 300 });
+    devA.tombstoneMgr.recordDeletion("d4.md", { deletedAt: now - 200 });
+    devA.tombstoneMgr.pruneOwnEntries(now);
+    assert.strictEqual(devA.tombstoneMgr.getOwnEntryCount(), 3, "GC must drop expired entry and cap to 3 newest entries");
+    const merged = devA.tombstoneMgr.getMergedTombstones("dev-aaaaaaaaaaaaaaaaaaaaaaaa", now);
+    assert.strictEqual(merged.has("expired.md"), false);
+    assert.strictEqual(merged.has("d1.md"), false);
+    assert.strictEqual(merged.has("d2.md"), true);
+    assert.strictEqual(merged.has("d3.md"), true);
+    assert.strictEqual(merged.has("d4.md"), true);
+
+    // Transient failure self-healing: fail tombstone upload on run 1 -> auto-retry succeeds on run 2 (even with 0 vault changes)
+    const cloud2 = createMockCloud();
+    const devRetry = makeDevice(cloud2, "dev-rrrrrrrrrrrrrrrrrrrrrrrr");
+    devRetry.vault.seedFile("ephemeral.md", "bye", Date.now() - 10_000);
+    assert.strictEqual((await devRetry.engine.startSync(false)).success, true);
+
+    devRetry.vault.files.delete("ephemeral.md");
+    cloud2.setFailTombstoneUploads(true);
+    const run1 = await devRetry.engine.startSync(false);
+    assert.strictEqual(run1.success, false, "Transient tombstone upload failure must report error");
+    assert.strictEqual(devRetry.tombstoneMgr.isOwnShardPendingUpload(), true, "Pending upload flag must persist for retry");
+
+    cloud2.setFailTombstoneUploads(false);
+    const run2 = await devRetry.engine.startSync(false);
+    assert.strictEqual(run2.success, true, "Next sync must self-heal and upload pending tombstone shard");
+    assert.strictEqual(devRetry.tombstoneMgr.isOwnShardPendingUpload(), false);
+    assert.ok(cloud2.files.has(buildRemoteTombstonePath("/apps/obsidian_vault", "dev-rrrrrrrrrrrrrrrrrrrrrrrr")));
+  }
+
+  // 10. Budgeted lazy localMd5 backfill for legacy E2EE manifests (<= v1.1.4)
+  {
+    const cloud = createMockCloud();
+    const pass = "Legacy-E2EE-Backfill-2026!";
+    const devA = makeDevice(
+      cloud,
+      "dev-aaaaaaaaaaaaaaaaaaaaaaaa",
+      { enableE2EE: true, e2eePassword: pass },
+      { e2eeMd5BackfillMaxFiles: 2 }
+    );
+    const devB = makeDevice(cloud, "dev-bbbbbbbbbbbbbbbbbbbbbbbb", { enableE2EE: true, e2eePassword: pass });
+
+    const t0 = Date.now() - 60_000;
+    for (let i = 1; i <= 5; i++) {
+      devA.vault.seedFile(`e2ee-${i}.md`, `legacy encrypted note #${i}`, t0);
+    }
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    assert.strictEqual((await devB.engine.startSync(false)).success, true);
+
+    // Simulate legacy <= v1.1.4 manifest on devA by stripping localMd5 from all 5 entries
+    for (let i = 1; i <= 5; i++) {
+      const m = devA.manifestMgr.get(`e2ee-${i}.md`)!;
+      devA.manifestMgr.set({ ...m, localMd5: undefined });
+    }
+    await devA.manifestMgr.save();
+
+    const countBackfilled = () =>
+      [1, 2, 3, 4, 5].filter((i) => Boolean(devA.manifestMgr.get(`e2ee-${i}.md`)?.localMd5)).length;
+    assert.strictEqual(countBackfilled(), 0);
+
+    // Run 1: budget 2 files -> 2 backfilled, 0 uploads/downloads
+    const upBefore = cloud.uploadedPaths.length;
+    const r1 = await devA.engine.startSync(false);
+    assert.strictEqual(r1.success, true);
+    assert.strictEqual(cloud.uploadedPaths.length, upBefore, "Backfill must perform 0 remote uploads");
+    assert.strictEqual(countBackfilled(), 2, "Run 1 must honor budget of 2 files");
+
+    // Run 2 -> 4 backfilled; Run 3 -> all 5 backfilled
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    assert.strictEqual(countBackfilled(), 4);
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+    assert.strictEqual(countBackfilled(), 5);
+    assert.strictEqual(
+      devA.manifestMgr.get("e2ee-1.md")?.localMd5,
+      md5(new TextEncoder().encode("legacy encrypted note #1").slice().buffer)
+    );
+
+    // Deleting backfilled e2ee-1.md now writes plaintext deletedHash into encrypted tombstone shard
+    devA.vault.files.delete("e2ee-1.md");
+    assert.strictEqual((await devA.engine.startSync(false)).success, true);
+
+    // Stale devB with wiped manifest & future-drifted mtime still matches deletedHash and trashes e2ee-1.md!
+    await devB.engine.resetLocalBaseline();
+    devB.vault.seedFile("e2ee-1.md", "legacy encrypted note #1", Date.now() + 3_600_000);
+    const resB = await devB.engine.startSync(false);
+    assert.strictEqual(resB.success, true);
+    assert.strictEqual(resB.stats.uploaded, 0);
+    assert.strictEqual(devB.vault.files.has("e2ee-1.md"), false);
+    assert.ok(devB.vault.trashed.includes("e2ee-1.md"));
+  }
+
+  // 11. Conservative auto-GC of retired peer device tombstone shards
+  {
+    const cloud = createMockCloud();
+    const now = Date.now();
+    const retentionMs = 10_000;
+    const graceMs = 5_000; // shard cutoff = 15s ago
+    const devActive = makeDevice(
+      cloud,
+      "dev-active0000000000000001",
+      {},
+      { tombstoneRetentionMs: retentionMs, tombstoneRetiredShardGraceMs: graceMs }
+    );
+    devActive.vault.seedFile("alive.md", "still alive", now - 2_000);
+    assert.strictEqual((await devActive.engine.startSync(false)).success, true);
+
+    const putShard = (devId: string, entries: Record<string, { deletedAt: number }>, serverMtimeMs: number) => {
+      const p = buildRemoteTombstonePath("/apps/obsidian_vault", devId);
+      const buf = new TextEncoder()
+        .encode(JSON.stringify({ version: 1, deviceId: devId, updatedAt: serverMtimeMs, entries }))
+        .slice().buffer;
+      cloud.putRaw(p, buf, Math.floor(serverMtimeMs / 1000));
+      return p;
+    };
+
+    // Retired shard (mtime 30s ago > 15s cutoff, all entries expired > 10s ago) -> MUST be cleaned up
+    const retiredPath = putShard(
+      "dev-retired000000000000001",
+      { "ancient.md": { deletedAt: now - 25_000 } },
+      now - 30_000
+    );
+    // Old mtime shard that STILL has 1 active non-expired entry -> MUST be kept
+    const activeEntryPath = putShard(
+      "dev-stillvalid000000000002",
+      { "recent.md": { deletedAt: now - 2_000 } },
+      now - 30_000
+    );
+    // Empty shard whose mtime is still within grace window (12s ago < 15s cutoff) -> MUST be kept
+    const withinGracePath = putShard("dev-grace00000000000000003", {}, now - 12_000);
+
+    const res = await devActive.engine.startSync(false);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(cloud.files.has(retiredPath), false, "Fully expired retired peer shard past grace period must be deleted");
+    assert.strictEqual(cloud.files.has(activeEntryPath), true, "Shard containing an active tombstone must NEVER be deleted");
+    assert.strictEqual(cloud.files.has(withinGracePath), true, "Shard within grace period must NEVER be deleted");
+  }
+
+  console.log("   All 3-layer stale-device deletion defense tests passed!");
+}
+
 async function runAll() {
   testMD5();
   testI18n();
@@ -2458,6 +3236,7 @@ async function runAll() {
   await testBridgeDeadlockCheckpointsAndFastScan();
   await testDataLossProtectionSuite();
   await testDeepAuditProtectionsSuite();
+  await testStaleDeviceDeletionDefenseSuite();
   console.log("🎉 All unit & integration tests passed successfully!");
 }
 

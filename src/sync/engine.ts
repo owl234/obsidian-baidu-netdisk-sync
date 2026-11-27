@@ -3,7 +3,16 @@ import { BaiduClient } from "../baidu/client";
 import { BaiduUploader } from "../baidu/uploader";
 import { BaiduDownloader } from "../baidu/downloader";
 import { BaiduFileMeta, FatalApiError, sanitizeErrorMessage } from "../baidu/types";
-import { ManifestItem, ManifestManager } from "./manifest";
+import { ManifestItem, ManifestManager, ManifestStorageAdapter } from "./manifest";
+import {
+  RemoteTombstoneShardRef,
+  TombstoneEntry,
+  TombstoneManager,
+  buildRemoteTombstonePath,
+  extractTombstoneDeviceId,
+  generateDeviceId,
+  isValidDeviceId
+} from "./tombstone";
 import { SyncFilter } from "./filter";
 import { AsyncQueue, QueueCancelledError } from "./queue";
 import {
@@ -19,7 +28,8 @@ import {
   SyncPlanItem,
   LocalFileInfo,
   RemoteFileInfo,
-  buildConflictPath
+  buildConflictPath,
+  getBaselinePlainMd5
 } from "./planner";
 import { md5 } from "../crypto/md5";
 import { t } from "../i18n";
@@ -73,6 +83,12 @@ export interface SyncEngineOptions {
   massDeleteMinCount?: number;
   massDeleteRatio?: number;
   emptySideGuardMinManifest?: number;
+  tombstones?: TombstoneManager;
+  tombstoneRetentionMs?: number;
+  tombstoneRetiredShardGraceMs?: number;
+  tombstoneMaxEntriesPerDevice?: number;
+  e2eeMd5BackfillMaxFiles?: number;
+  e2eeMd5BackfillMaxBytes?: number;
 }
 
 interface SyncRunContext {
@@ -101,6 +117,8 @@ const DEFAULT_CHECKPOINT_INTERVAL_MS = 20_000;
 const DEFAULT_MASS_DELETE_MIN_COUNT = 10;
 const DEFAULT_MASS_DELETE_RATIO = 0.5;
 const DEFAULT_EMPTY_SIDE_GUARD_MIN_MANIFEST = 5;
+const DEFAULT_E2EE_BACKFILL_MAX_FILES = 50;
+const DEFAULT_E2EE_BACKFILL_MAX_BYTES = 16 * 1024 * 1024;
 
 function buffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   if (a.byteLength !== b.byteLength) return false;
@@ -112,8 +130,19 @@ function buffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   return true;
 }
 
+export type StaleSyncResolution = "trust-cloud" | "merge-upload";
+
+export interface StaleGuardInfo {
+  reason: "empty-baseline" | "stale-days";
+  uploadCount: number;
+  remoteCount: number;
+  staleDays: number;
+  samplePaths: string[];
+}
+
 export interface SyncRunOptions {
   bypassMassDeleteGuard?: boolean;
+  staleResolution?: StaleSyncResolution;
 }
 
 export interface SyncRunResult {
@@ -122,6 +151,7 @@ export interface SyncRunResult {
   bridgeDead?: boolean;
   massDeleteAborted?: boolean;
   manifestCorrupted?: boolean;
+  staleGuardAborted?: boolean;
 }
 
 export function normalizeAndValidateRemoteBasePath(raw: string): {
@@ -178,6 +208,9 @@ export class SyncEngine {
   private migrationActive = false;
   private lastRunMassDeleteAborted = false;
   private lastRunManifestCorrupted = false;
+  private lastRunStaleGuardAborted = false;
+  private lastStaleGuardInfo: StaleGuardInfo | null = null;
+  private readonly tombstones: TombstoneManager;
 
   private readonly fsMetaTimeoutMs: number;
   private readonly fsBinaryTimeoutMs: number;
@@ -187,6 +220,8 @@ export class SyncEngine {
   private readonly massDeleteMinCount: number;
   private readonly massDeleteRatio: number;
   private readonly emptySideGuardMinManifest: number;
+  private readonly e2eeMd5BackfillMaxFiles: number;
+  private readonly e2eeMd5BackfillMaxBytes: number;
 
   constructor(
     private vault: VaultSyncBridge,
@@ -210,6 +245,37 @@ export class SyncEngine {
     this.massDeleteRatio = options.massDeleteRatio ?? DEFAULT_MASS_DELETE_RATIO;
     this.emptySideGuardMinManifest =
       options.emptySideGuardMinManifest ?? DEFAULT_EMPTY_SIDE_GUARD_MIN_MANIFEST;
+    this.e2eeMd5BackfillMaxFiles =
+      options.e2eeMd5BackfillMaxFiles ?? DEFAULT_E2EE_BACKFILL_MAX_FILES;
+    this.e2eeMd5BackfillMaxBytes =
+      options.e2eeMd5BackfillMaxBytes ?? DEFAULT_E2EE_BACKFILL_MAX_BYTES;
+
+    if (options.tombstones) {
+      this.tombstones = options.tombstones;
+    } else {
+      const fallbackPluginDir = this.vault.configDir
+        ? `${this.vault.configDir}/plugins/baidu-netdisk-sync`
+        : "plugins/baidu-netdisk-sync";
+      const cleanPluginDir = (pluginDir || fallbackPluginDir)
+        .replace(/\\/g, "/")
+        .replace(/^\/+/, "")
+        .replace(/\/+$/, "");
+      const textAdapter: ManifestStorageAdapter = {
+        exists: (p: string) => this.vault.exists(p),
+        mkdir: (p: string) => this.vault.mkdir(p),
+        read: async (p: string) => new TextDecoder().decode(await this.vault.readBinary(p)),
+        write: async (p: string, data: string) => {
+          const encoded = new TextEncoder().encode(data).slice().buffer;
+          await this.vault.writeBinary(p, encoded);
+        }
+      };
+      this.tombstones = new TombstoneManager(textAdapter, `${cleanPluginDir}/tombstone_cache.json`, {
+        adapterTimeoutMs: this.fsMetaTimeoutMs,
+        retentionMs: options.tombstoneRetentionMs,
+        retiredShardGraceMs: options.tombstoneRetiredShardGraceMs,
+        maxEntriesPerDevice: options.tombstoneMaxEntriesPerDevice
+      });
+    }
   }
 
   onStateChange(listener: (state: SyncState, message?: string) => void): () => void {
@@ -262,6 +328,26 @@ export class SyncEngine {
     return this.lastRunManifestCorrupted;
   }
 
+  wasLastRunStaleGuardAborted(): boolean {
+    return this.lastRunStaleGuardAborted;
+  }
+
+  getLastStaleGuardInfo(): StaleGuardInfo | null {
+    return this.lastStaleGuardInfo ? { ...this.lastStaleGuardInfo, samplePaths: [...this.lastStaleGuardInfo.samplePaths] } : null;
+  }
+
+  getTombstoneManager(): TombstoneManager {
+    return this.tombstones;
+  }
+
+  async resetTombstoneCache(): Promise<void> {
+    if (this.isSyncing()) {
+      throw new Error(t("engine.alreadyRunning"));
+    }
+    const { normalized } = normalizeAndValidateRemoteBasePath(this.getSettings().remoteBasePath);
+    await this.tombstones.resetCache(normalized || undefined);
+  }
+
   /**
    * Cleanly cancels any active sync or migration run (e.g. on plugin unload).
    */
@@ -285,6 +371,8 @@ export class SyncEngine {
     await this.manifest.resetBaseline(normalized || undefined);
     this.lastRunMassDeleteAborted = false;
     this.lastRunManifestCorrupted = false;
+    this.lastRunStaleGuardAborted = false;
+    this.lastStaleGuardInfo = null;
     this.addLog("warn", t("engine.manifestBaselineReset"));
     this.setState("idle", t("statusBar.ready"));
   }
@@ -605,42 +693,223 @@ export class SyncEngine {
     }
   }
 
+  private async ensureDeviceId(settings: BaiduSyncSettings): Promise<string> {
+    if (isValidDeviceId(settings.deviceId)) {
+      return settings.deviceId;
+    }
+    const liveSettings = this.getSettings();
+    if (isValidDeviceId(liveSettings.deviceId)) {
+      settings.deviceId = liveSettings.deviceId;
+      return liveSettings.deviceId;
+    }
+    const generated = generateDeviceId();
+    settings.deviceId = generated;
+    liveSettings.deviceId = generated;
+    await this.saveSettings(liveSettings);
+    return generated;
+  }
+
+  private async syncRemoteTombstoneShards(
+    remoteShards: RemoteTombstoneShardRef[],
+    currentDeviceId: string,
+    settings: BaiduSyncSettings
+  ): Promise<{ downloaded: number; skippedCached: number }> {
+    return this.tombstones.syncRemoteShards(remoteShards, currentDeviceId, async (shard) => {
+      const downloadOpts = {
+        e2eePassword: settings.e2eePassword,
+        expectedSize: shard.size
+      };
+      try {
+        return await this.downloader.downloadByFsId(shard.fsId, downloadOpts);
+      } catch (err: unknown) {
+        if (isLikelyExpiredDlinkError(err)) {
+          return this.downloader.downloadByFsId(shard.fsId, downloadOpts);
+        }
+        throw err;
+      }
+    });
+  }
+
+  private async flushOwnTombstoneShard(
+    cleanBase: string,
+    currentDeviceId: string,
+    settings: BaiduSyncSettings,
+    forcePlaintext = false
+  ): Promise<void> {
+    const payload = this.tombstones.buildOwnShardPayload(currentDeviceId);
+    const remotePath = buildRemoteTombstonePath(cleanBase, currentDeviceId);
+    const uploadRes = await this.uploader.uploadFile(
+      remotePath,
+      payload,
+      forcePlaintext
+        ? { enableE2EE: false }
+        : { enableE2EE: settings.enableE2EE, e2eePassword: settings.e2eePassword }
+    );
+    this.tombstones.markOwnShardUploaded(currentDeviceId, {
+      fsId: uploadRes.fs_id,
+      remoteMtime: (uploadRes.mtime || Math.floor(Date.now() / 1000)) * 1000,
+      remoteSize: uploadRes.size
+    });
+  }
+
   /**
-   * For plaintext sync when manifest is absent (or both sides changed with same size),
-   * lazily compute local MD5 only for same-size candidates so identical files skip transfer.
+   * Budgeted lazy backfill of plaintext `localMd5` for legacy E2EE manifest entries (<= v1.1.4).
+   * Processes at most `e2eeMd5BackfillMaxFiles` (default 50) and `e2eeMd5BackfillMaxBytes` (default 16MB)
+   * per sync run with zero network traffic so mobile vaults upgrade smoothly without stalling.
    */
-  private async populateCandidateLocalMd5(
+  private async backfillLegacyE2EELocalMd5(
     localFiles: Map<string, LocalFileInfo>,
     remoteFiles: Map<string, RemoteFileInfo>,
     settings: BaiduSyncSettings,
     ctx: SyncRunContext
+  ): Promise<number> {
+    if (
+      !settings.enableE2EE ||
+      this.e2eeMd5BackfillMaxFiles <= 0 ||
+      this.e2eeMd5BackfillMaxBytes <= 0
+    ) {
+      return 0;
+    }
+
+    const maxFileBytes = this.getMaxBytes(settings);
+    let backfilledCount = 0;
+    let backfilledBytes = 0;
+
+    for (const [canonicalKey, local] of localFiles) {
+      if (!ctx.isCurrent()) break;
+      if (
+        backfilledCount >= this.e2eeMd5BackfillMaxFiles ||
+        backfilledBytes >= this.e2eeMd5BackfillMaxBytes
+      ) {
+        break;
+      }
+
+      const m = this.manifest.get(canonicalKey);
+      if (!m || m.localMd5) continue;
+      if (!remoteFiles.has(canonicalKey)) continue;
+      if (local.size !== m.size || Math.abs(local.mtime - m.mtime) > 1000) continue;
+      if (local.size > maxFileBytes) continue;
+      if (backfilledCount > 0 && backfilledBytes + local.size > this.e2eeMd5BackfillMaxBytes) {
+        continue;
+      }
+
+      try {
+        const buf = await ctx.readBinary(local.path);
+        if (!ctx.isCurrent()) break;
+        if (buf.byteLength !== m.size) continue;
+        this.manifest.set({
+          ...m,
+          localMd5: md5(buf)
+        });
+        backfilledCount++;
+        backfilledBytes += buf.byteLength;
+      } catch (err: unknown) {
+        if (err instanceof BridgeDeadlockError || err instanceof QueueCancelledError) {
+          throw err;
+        }
+        // Best-effort single-file backfill; skip transient read errors
+      }
+    }
+
+    if (backfilledCount > 0 && ctx.isCurrent()) {
+      this.addLog("info", t("engine.e2eeMd5Backfilled", { count: backfilledCount }));
+    }
+    return backfilledCount;
+  }
+
+  private async cleanupRetiredTombstoneShards(
+    remoteShards: RemoteTombstoneShardRef[],
+    currentDeviceId: string,
+    ctx: SyncRunContext
   ): Promise<void> {
-    if (settings.enableE2EE) return;
-    const manifestAll = this.manifest.getAll();
+    if (!ctx.isCurrent() || remoteShards.length === 0) return;
+    const retired = this.tombstones.getRetiredRemoteShards(remoteShards, currentDeviceId);
+    if (retired.length === 0) return;
+
+    try {
+      await this.client.deleteFiles(retired.map((s) => s.remotePath));
+      if (!ctx.isCurrent()) return;
+      this.tombstones.removeCachedRemoteShards(retired.map((s) => s.deviceId));
+      this.addLog("info", t("engine.tombstoneRetiredShardsCleaned", { count: retired.length }));
+    } catch (err: unknown) {
+      if (ctx.isCurrent()) {
+        const detail = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+        this.addLog("warn", t("engine.tombstoneRetiredShardsCleanupFailed", { detail }));
+      }
+    }
+  }
+
+  /**
+   * Lazily computes local plaintext MD5 ONLY for files that actually need content verification:
+   * 1. Plaintext same-size dedup when manifest is absent or both sides changed.
+   * 2. `!remote` files with drifted local mtime vs manifest (prevents false resurrection under both plaintext & E2EE).
+   * 3. `!remote` files matching a cloud tombstone path with recorded hash (verifies exact deleted content).
+   */
+  private async populateCandidateLocalMd5(
+    localFiles: Map<string, LocalFileInfo>,
+    remoteFiles: Map<string, RemoteFileInfo>,
+    manifestAll: Record<string, ManifestItem>,
+    tombstones: Map<string, TombstoneEntry>,
+    settings: BaiduSyncSettings,
+    ctx: SyncRunContext
+  ): Promise<void> {
     const maxBytes = this.getMaxBytes(settings);
 
     for (const [canonicalKey, local] of localFiles) {
       if (!ctx.isCurrent()) return;
-      const remote = remoteFiles.get(canonicalKey);
-      if (!remote || !remote.md5) continue;
-      if (local.size !== remote.size || local.size > maxBytes) continue;
+      if (local.size > maxBytes) continue;
 
+      const remote = remoteFiles.get(canonicalKey);
       const manifestItem = manifestAll[canonicalKey];
-      if (manifestItem) {
-        const localChanged =
-          Math.abs(local.mtime - manifestItem.mtime) > 1000 || local.size !== manifestItem.size;
-        const expectedRemoteSize =
-          manifestItem.remoteSize !== undefined ? manifestItem.remoteSize : manifestItem.size;
-        const fsIdChanged =
-          Boolean(manifestItem.fsId) &&
-          Boolean(remote.fsId) &&
-          String(remote.fsId) !== String(manifestItem.fsId);
-        const remoteChanged =
-          Math.abs(remote.mtime - manifestItem.remoteMtime) > 1000 ||
-          remote.size !== expectedRemoteSize ||
-          fsIdChanged;
-        if (!(localChanged && remoteChanged)) continue;
+      const tombstone = tombstones.get(canonicalKey);
+
+      let needsLocalHash = false;
+
+      if (remote) {
+        // Case 1: Plaintext dedup when both sides exist with equal size
+        if (!settings.enableE2EE && remote.md5 && local.size === remote.size) {
+          if (!manifestItem) {
+            needsLocalHash = true;
+          } else {
+            const localChanged =
+              Math.abs(local.mtime - manifestItem.mtime) > 1000 || local.size !== manifestItem.size;
+            const expectedRemoteSize =
+              manifestItem.remoteSize !== undefined ? manifestItem.remoteSize : manifestItem.size;
+            const fsIdChanged =
+              Boolean(manifestItem.fsId) &&
+              Boolean(remote.fsId) &&
+              String(remote.fsId) !== String(manifestItem.fsId);
+            const remoteChanged =
+              Math.abs(remote.mtime - manifestItem.remoteMtime) > 1000 ||
+              remote.size !== expectedRemoteSize ||
+              fsIdChanged;
+            if (localChanged && remoteChanged) {
+              needsLocalHash = true;
+            }
+          }
+        }
+      } else {
+        // Case 2: Remote absent — verify drifted mtime against manifest plaintext hash
+        if (
+          manifestItem &&
+          local.size === manifestItem.size &&
+          Math.abs(local.mtime - manifestItem.mtime) > 1000 &&
+          Boolean(getBaselinePlainMd5(manifestItem, settings.enableE2EE))
+        ) {
+          needsLocalHash = true;
+        }
+        // Case 3: Remote absent — verify content hash against cloud tombstone
+        if (
+          !needsLocalHash &&
+          tombstone &&
+          Boolean(tombstone.deletedHash) &&
+          (tombstone.deletedSize === undefined || local.size === tombstone.deletedSize)
+        ) {
+          needsLocalHash = true;
+        }
       }
+
+      if (!needsLocalHash) continue;
 
       try {
         const buf = await ctx.readBinary(local.path);
@@ -703,6 +972,8 @@ export class SyncEngine {
     this.activeRunId = runId;
     this.lastRunMassDeleteAborted = false;
     this.lastRunManifestCorrupted = false;
+    this.lastRunStaleGuardAborted = false;
+    this.lastStaleGuardInfo = null;
     this.filter.updateSettings(settings);
     const ctx = this.createRunContext(runId, settings.concurrency || 3);
     this.activeCtx = ctx;
@@ -714,9 +985,12 @@ export class SyncEngine {
     let runSucceeded = false;
 
     try {
+      const currentDeviceId = await this.ensureDeviceId(settings);
+
       this.setState("preparing", t("engine.loadingManifest"));
       try {
         await this.manifest.load();
+        await this.tombstones.load();
       } catch (err: unknown) {
         if (err instanceof OperationTimeoutError && err.kind === "vault") {
           const alive = await this.probeBridgeHealth(ctx);
@@ -736,13 +1010,26 @@ export class SyncEngine {
         this.addLog("warn", t("engine.manifestRecoveredFromBackup"));
       }
 
+      this.tombstones.ensureRemoteBase(cleanBase, currentDeviceId);
+
       // Step 1: Scan local files
       this.setState("diffing", t("engine.scanningLocal"));
       const localFiles = await this.scanLocalFiles(ctx, settings);
 
-      // Step 2: Scan remote files (including case-collision detection)
+      // Step 2: Scan remote files (including case-collision detection & cloud tombstone shards)
       this.setState("diffing", t("engine.scanningRemote"));
-      const { files: remoteFiles, caseCollisions } = await this.scanRemoteFiles(cleanBase);
+      const { files: remoteFiles, caseCollisions, tombstoneShards } = await this.scanRemoteFiles(cleanBase);
+
+      // Step 2.5: Incrementally sync cloud tombstone shards (fail-closed on decrypt/fetch error)
+      if (tombstoneShards.length > 0) {
+        try {
+          await this.syncRemoteTombstoneShards(tombstoneShards, currentDeviceId, settings);
+        } catch (err: unknown) {
+          const detail = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+          throw new Error(t("engine.tombstoneSyncFailed", { detail }));
+        }
+      }
+      const mergedTombstones = this.tombstones.getMergedTombstones(currentDeviceId);
 
       // Step 3: Guard against remoteBasePath change (reset stale baseline so local files are never wiped)
       const expectedPrefix = `${cleanBase}/`;
@@ -824,39 +1111,59 @@ export class SyncEngine {
       // Step 3.2: Verify any statFast-suspected local changes against real disk stat
       await this.reverifySuspectedLocalChanges(localFiles, activeManifestFiles, ctx);
 
-      // Compute local MD5 for plaintext dedup candidates & build diff plan
+      // Compute local MD5 for plaintext dedup, mtime-drift verification, and tombstone matching
       this.setState("diffing", t("engine.computingPlan"));
-      await this.populateCandidateLocalMd5(localFiles, remoteFiles, settings, ctx);
+      await this.populateCandidateLocalMd5(
+        localFiles,
+        remoteFiles,
+        activeManifestFiles,
+        mergedTombstones,
+        settings,
+        ctx
+      );
 
-      const plans = SyncPlanner.plan(
+      let plans = SyncPlanner.plan(
         localFiles,
         remoteFiles,
         activeManifestFiles,
         cleanBase,
         {
           conflictStrategy: settings.conflictStrategy,
-          enableE2EE: settings.enableE2EE
+          enableE2EE: settings.enableE2EE,
+          tombstones: mergedTombstones,
+          currentDeviceId
         }
       );
 
       // Step 3.5: Bidirectional mass-deletion safety circuit breaker
+      // Tombstone-verified local deletions are explicitly corroborated by another device's deletion
+      // record and flow smoothly to local .trash; unverified disappearances stay strictly guarded.
       let trackedCount = 0;
       for (const k of Object.keys(activeManifestFiles)) {
         if (!this.filter.shouldIgnore(k, false)) {
           trackedCount++;
         }
       }
-      const localDeleteCount = plans.filter((p) => p.action === "DELETE_LOCAL").length;
+      const localDeletePlans = plans.filter((p) => p.action === "DELETE_LOCAL");
+      const unverifiedLocalDeleteCount = localDeletePlans.filter((p) => !p.tombstoneVerified).length;
+      const verifiedLocalDeleteCount = localDeletePlans.length - unverifiedLocalDeleteCount;
       const remoteDeleteCount = plans.filter((p) => p.action === "DELETE_REMOTE").length;
+
+      if (verifiedLocalDeleteCount > 0) {
+        this.addLog(
+          "info",
+          t("engine.tombstoneVerifiedDeletes", { count: verifiedLocalDeleteCount })
+        );
+      }
 
       const localWipeEmptyRemote =
         trackedCount >= this.emptySideGuardMinManifest &&
         remoteFiles.size === 0 &&
-        localDeleteCount >= this.emptySideGuardMinManifest;
+        unverifiedLocalDeleteCount >= this.emptySideGuardMinManifest;
       const localWipeMass =
-        localDeleteCount >= this.massDeleteMinCount &&
+        unverifiedLocalDeleteCount >= this.massDeleteMinCount &&
         trackedCount > 0 &&
-        localDeleteCount / trackedCount >= this.massDeleteRatio;
+        unverifiedLocalDeleteCount / trackedCount >= this.massDeleteRatio;
 
       const remoteWipeEmptyLocal =
         trackedCount >= this.emptySideGuardMinManifest &&
@@ -872,7 +1179,7 @@ export class SyncEngine {
           this.addLog("warn", t("engine.massDeleteBypassed"));
         } else {
           const msg = t("engine.massDeleteLocalAborted", {
-            count: localDeleteCount,
+            count: unverifiedLocalDeleteCount,
             total: trackedCount,
             remoteCount: remoteFiles.size
           });
@@ -899,7 +1206,109 @@ export class SyncEngine {
         }
       }
 
+      // Step 3.6: Layer 3 Stale-Device & Empty-Baseline Wakeup Guard
+      const unexplainedLocalOnlyUploads = plans.filter((p) => p.action === "UPLOAD" && !p.remote);
+      const staleThresholdDays =
+        typeof settings.staleSyncThresholdDays === "number" && Number.isFinite(settings.staleSyncThresholdDays)
+          ? Math.max(0, settings.staleSyncThresholdDays)
+          : 30;
+      const lastSyncTime = this.manifest.getLastSyncTime();
+      const elapsedSinceLastSync = lastSyncTime > 0 ? Math.max(0, Date.now() - lastSyncTime) : 0;
+      const staleDays = Math.floor(elapsedSinceLastSync / 86_400_000);
+
+      const isEmptyBaselineToPopulatedRemote =
+        trackedCount === 0 &&
+        remoteFiles.size > 0 &&
+        unexplainedLocalOnlyUploads.length > 0;
+      const isStaleDeviceWithUploads =
+        staleThresholdDays > 0 &&
+        lastSyncTime > 0 &&
+        elapsedSinceLastSync >= staleThresholdDays * 86_400_000 &&
+        unexplainedLocalOnlyUploads.length > 0;
+
+      if (isEmptyBaselineToPopulatedRemote || isStaleDeviceWithUploads) {
+        if (!options.staleResolution) {
+          const samplePaths = unexplainedLocalOnlyUploads.slice(0, 5).map((p) => p.path);
+          this.lastRunStaleGuardAborted = true;
+          this.lastStaleGuardInfo = {
+            reason: isEmptyBaselineToPopulatedRemote ? "empty-baseline" : "stale-days",
+            uploadCount: unexplainedLocalOnlyUploads.length,
+            remoteCount: remoteFiles.size,
+            staleDays,
+            samplePaths
+          };
+          const msg = isEmptyBaselineToPopulatedRemote
+            ? t("engine.staleGuardEmptyBaselineAborted", {
+                uploadCount: unexplainedLocalOnlyUploads.length,
+                remoteCount: remoteFiles.size
+              })
+            : t("engine.staleGuardOfflineAborted", {
+                days: staleDays,
+                uploadCount: unexplainedLocalOnlyUploads.length
+              });
+          const detail = samplePaths.length > 0 ? samplePaths.join(", ") : undefined;
+          this.addLog("error", msg, detail);
+          this.setState("error", msg);
+          return { success: false, stats, staleGuardAborted: true };
+        }
+
+        if (options.staleResolution === "trust-cloud") {
+          let trashedLocalOnly = 0;
+          let restoredRemoteDeletes = 0;
+          plans = plans.map((p) => {
+            if (p.action === "UPLOAD" && !p.remote) {
+              trashedLocalOnly++;
+              return {
+                ...p,
+                action: "DELETE_LOCAL",
+                tombstoneVerified: true,
+                reason: t("plan.trustCloudTrashLocal")
+              };
+            }
+            if (p.action === "DELETE_REMOTE" && !p.local && p.remote) {
+              restoredRemoteDeletes++;
+              return {
+                ...p,
+                action: "DOWNLOAD",
+                reason: t("plan.trustCloudRestoreRemote")
+              };
+            }
+            return p;
+          });
+          this.addLog(
+            "warn",
+            t("engine.staleTrustCloudApplied", {
+              trashed: trashedLocalOnly,
+              restored: restoredRemoteDeletes
+            })
+          );
+        } else if (options.staleResolution === "merge-upload") {
+          this.addLog(
+            "warn",
+            t("engine.staleMergeUploadApplied", {
+              count: unexplainedLocalOnlyUploads.length
+            })
+          );
+        }
+      }
+
+      // Step 3.7: Budgeted lazy backfill of plaintext localMd5 for legacy E2EE manifest entries
+      await this.backfillLegacyE2EELocalMd5(localFiles, remoteFiles, settings, ctx);
+
       if (plans.length === 0) {
+        if (this.tombstones.isOwnShardPendingUpload()) {
+          try {
+            await this.flushOwnTombstoneShard(cleanBase, currentDeviceId, settings);
+          } catch (err: unknown) {
+            stats.errors++;
+            const detail = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+            this.addLog("warn", t("engine.tombstoneUploadFailed", { detail }));
+          }
+        }
+        await this.cleanupRetiredTombstoneShards(tombstoneShards, currentDeviceId, ctx);
+        if (this.tombstones.isDirty()) {
+          await this.tombstones.save();
+        }
         if (this.manifest.isDirty()) {
           this.manifest.setRemoteBasePath(cleanBase);
           this.manifest.updateLastSyncTime();
@@ -945,11 +1354,11 @@ export class SyncEngine {
       }
 
       // Phased execution order:
-      // 1) Batched DELETE_REMOTE (with local existence TOCTOU guard)
+      // 1) Batched DELETE_REMOTE (with local existence TOCTOU guard + cloud tombstone recording)
       // 2) DELETE_LOCAL phase (must finish strictly BEFORE DOWNLOAD/UPLOAD/CONFLICT so
       //    case-only renames like Note.md -> note.md never delete the freshly downloaded file
       //    on case-insensitive macOS/Windows/iOS filesystems)
-      // 3) Remaining concurrent UPLOAD / DOWNLOAD / CONFLICT / manifest updates
+      // 3) Remaining concurrent UPLOAD / DOWNLOAD / CONFLICT / DELETE_CONFLICT / manifest updates
       const remoteDeleteItems = plans.filter((p) => p.action === "DELETE_REMOTE");
       const localDeleteItems = plans.filter((p) => p.action === "DELETE_LOCAL");
       const otherItems = plans.filter(
@@ -983,7 +1392,28 @@ export class SyncEngine {
           try {
             await this.client.deleteFiles(remotePaths);
             if (!ctx.isCurrent()) break;
+            const deletedAt = Date.now();
             for (const b of toDelete) {
+              const plainHash = b.manifest
+                ? getBaselinePlainMd5(b.manifest, settings.enableE2EE)
+                : !settings.enableE2EE && b.remote?.md5
+                  ? b.remote.md5.toLowerCase()
+                  : undefined;
+              const deletedSize =
+                b.manifest?.size ?? (!settings.enableE2EE ? b.remote?.size : undefined);
+              const deletedFsId =
+                b.remote?.fsId !== undefined
+                  ? String(b.remote.fsId)
+                  : b.manifest?.fsId !== undefined
+                    ? String(b.manifest.fsId)
+                    : undefined;
+              this.tombstones.recordDeletion(b.path, {
+                deletedAt,
+                deletedHash: plainHash,
+                deletedSize,
+                deletedFsId,
+                deletedMtime: b.manifest?.mtime ?? b.remote?.mtime
+              });
               this.manifest.delete(b.path);
             }
             completedMutations += toDelete.length;
@@ -1074,10 +1504,24 @@ export class SyncEngine {
       // Phase 2: Complete all DELETE_LOCAL before any DOWNLOAD/UPLOAD/CONFLICT
       await runQueuedPhase(localDeleteItems);
 
-      // Phase 3: Execute concurrent UPLOAD / DOWNLOAD / CONFLICT / manifest updates
+      // Phase 3: Execute concurrent UPLOAD / DOWNLOAD / CONFLICT / DELETE_CONFLICT / manifest updates
       await runQueuedPhase(otherItems);
 
-      // Step 5: Final manifest & settings save (write failure MUST fail the run)
+      // Step 5: Flush cloud tombstone shard (if dirty), GC retired peer shards, save cache, manifest & settings
+      if (this.tombstones.isOwnShardPendingUpload()) {
+        try {
+          await this.flushOwnTombstoneShard(cleanBase, currentDeviceId, settings);
+        } catch (err: unknown) {
+          stats.errors++;
+          const detail = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+          this.addLog("warn", t("engine.tombstoneUploadFailed", { detail }));
+        }
+      }
+      await this.cleanupRetiredTombstoneShards(tombstoneShards, currentDeviceId, ctx);
+      if (this.tombstones.isDirty()) {
+        await this.tombstones.save();
+      }
+
       this.manifest.setRemoteBasePath(cleanBase);
       this.manifest.updateLastSyncTime();
       await this.manifest.save();
@@ -1134,6 +1578,13 @@ export class SyncEngine {
             saveErr instanceof Error ? saveErr.message : String(saveErr)
           );
           this.addLog("error", t("engine.manifestSaveFailed", { detail }));
+        }
+      }
+      if (!ctx.bridgeDead && this.tombstones.isDirty()) {
+        try {
+          await this.tombstones.save();
+        } catch {
+          // Best-effort cache flush; cloud shards remain authoritative
         }
       }
       if (this.activeRunId === runId) {
@@ -1236,6 +1687,7 @@ export class SyncEngine {
           localSize = buffer.byteLength;
         }
 
+        const localPlainMd5 = md5(buffer);
         const res = await this.uploader.uploadFile(item.remotePath, buffer, {
           enableE2EE: settings.enableE2EE,
           e2eePassword: settings.e2eePassword
@@ -1245,12 +1697,14 @@ export class SyncEngine {
           return "none";
         }
 
+        this.tombstones.clearOwnEntry(item.path);
         this.manifest.set({
           path: item.path,
           remotePath: item.remotePath,
           mtime: localMtime,
           remoteMtime: (res.mtime || Math.floor(Date.now() / 1000)) * 1000,
           md5: res.md5 || "",
+          localMd5: localPlainMd5,
           size: localSize,
           remoteSize: res.size,
           fsId: res.fs_id
@@ -1307,6 +1761,7 @@ export class SyncEngine {
           mtime: stat?.mtime || Date.now(),
           remoteMtime: item.remote.mtime,
           md5: item.remote.md5 || "",
+          localMd5: md5(buffer),
           size: buffer.byteLength,
           remoteSize: item.remote.size,
           fsId: item.remote.fsId
@@ -1348,6 +1803,7 @@ export class SyncEngine {
           return "skipped";
         }
 
+        const localPlainMd5 = md5(localBuffer);
         // If decrypted contents are byte-for-byte identical, skip creating any conflict copy
         if (buffersEqual(localBuffer, remoteBuffer)) {
           this.manifest.set({
@@ -1356,6 +1812,7 @@ export class SyncEngine {
             mtime: preLocalStat.mtime,
             remoteMtime: item.remote.mtime,
             md5: item.remote.md5 || "",
+            localMd5: localPlainMd5,
             size: localBuffer.byteLength,
             remoteSize: item.remote.size,
             fsId: item.remote.fsId
@@ -1364,6 +1821,7 @@ export class SyncEngine {
           return "manifest";
         }
 
+        const remotePlainMd5 = md5(remoteBuffer);
         const conflictPath = await this.resolveUniqueConflictPath(item.path, remoteFiles, ctx);
         const cleanBase = normalizeRemoteBase(settings.remoteBasePath);
         const conflictRemotePath = `${cleanBase}/${conflictPath}`;
@@ -1388,6 +1846,7 @@ export class SyncEngine {
             mtime: conflictStat?.mtime || Date.now(),
             remoteMtime: (conflictUploadRes.mtime || Math.floor(Date.now() / 1000)) * 1000,
             md5: conflictUploadRes.md5 || "",
+            localMd5: remotePlainMd5,
             size: remoteBuffer.byteLength,
             remoteSize: conflictUploadRes.size,
             fsId: conflictUploadRes.fs_id
@@ -1406,6 +1865,7 @@ export class SyncEngine {
             mtime: preLocalStat.mtime,
             remoteMtime: (mainUploadRes.mtime || Math.floor(Date.now() / 1000)) * 1000,
             md5: mainUploadRes.md5 || "",
+            localMd5: localPlainMd5,
             size: localBuffer.byteLength,
             remoteSize: mainUploadRes.size,
             fsId: mainUploadRes.fs_id
@@ -1439,6 +1899,7 @@ export class SyncEngine {
             mtime: conflictStat?.mtime || Date.now(),
             remoteMtime: (conflictUploadRes.mtime || Math.floor(Date.now() / 1000)) * 1000,
             md5: conflictUploadRes.md5 || "",
+            localMd5: localPlainMd5,
             size: localBuffer.byteLength,
             remoteSize: conflictUploadRes.size,
             fsId: conflictUploadRes.fs_id
@@ -1467,6 +1928,7 @@ export class SyncEngine {
             mtime: mainStat?.mtime || Date.now(),
             remoteMtime: item.remote.mtime,
             md5: item.remote.md5 || "",
+            localMd5: remotePlainMd5,
             size: remoteBuffer.byteLength,
             remoteSize: item.remote.size,
             fsId: item.remote.fsId
@@ -1474,6 +1936,83 @@ export class SyncEngine {
         }
 
         this.addLog("warn", t("engine.conflictPreserved", { path: item.path, conflictPath }));
+        return "conflict";
+      }
+
+      case "DELETE_CONFLICT": {
+        if (!item.local) {
+          return "none";
+        }
+        if (this.isOversized(item.local.size, settings, item.path)) {
+          return "skipped";
+        }
+
+        const preLocalStat = await ctx.stat(localDiskPath);
+        if (!preLocalStat || preLocalStat.type !== "file") {
+          this.addLog("warn", t("engine.conflictSkippedModified", { path: item.path }));
+          return "skipped";
+        }
+
+        const localBuffer = await ctx.readBinary(localDiskPath);
+        if (!ctx.isCurrent()) return "none";
+
+        if (localBuffer.byteLength !== preLocalStat.size) {
+          this.addLog("warn", t("engine.conflictSkippedModified", { path: item.path }));
+          return "skipped";
+        }
+
+        const localPlainMd5 = md5(localBuffer);
+        const conflictPath = await this.resolveUniqueConflictPath(item.path, remoteFiles, ctx);
+        const cleanBase = normalizeRemoteBase(settings.remoteBasePath);
+        const conflictRemotePath = `${cleanBase}/${conflictPath}`;
+
+        await this.ensureParentDir(conflictPath, ensuredDirs, ctx);
+        this.markSyncWrite(conflictPath);
+        await ctx.writeBinary(conflictPath, localBuffer);
+        this.markSyncWrite(conflictPath);
+        const conflictStat = await ctx.stat(conflictPath);
+
+        const conflictUploadRes = await this.uploader.uploadFile(conflictRemotePath, localBuffer, {
+          enableE2EE: settings.enableE2EE,
+          e2eePassword: settings.e2eePassword
+        });
+        if (!ctx.isCurrent()) return "none";
+
+        this.tombstones.clearOwnEntry(conflictPath);
+        this.manifest.set({
+          path: conflictPath,
+          remotePath: conflictRemotePath,
+          mtime: conflictStat?.mtime || Date.now(),
+          remoteMtime: (conflictUploadRes.mtime || Math.floor(Date.now() / 1000)) * 1000,
+          md5: conflictUploadRes.md5 || "",
+          localMd5: localPlainMd5,
+          size: localBuffer.byteLength,
+          remoteSize: conflictUploadRes.size,
+          fsId: conflictUploadRes.fs_id
+        });
+
+        // Final TOCTOU check on original path before moving it to local trash
+        const postLocalStat = await ctx.stat(localDiskPath);
+        if (
+          postLocalStat &&
+          postLocalStat.type === "file" &&
+          Math.abs(postLocalStat.mtime - preLocalStat.mtime) <= 1000 &&
+          postLocalStat.size === preLocalStat.size
+        ) {
+          this.markSyncWrite(localDiskPath);
+          await ctx.trashFile(localDiskPath);
+          this.markSyncWrite(localDiskPath);
+          if (ctx.isCurrent()) {
+            this.manifest.delete(item.path);
+          }
+        } else {
+          this.addLog("warn", t("engine.deleteLocalSkippedModified", { path: item.path }));
+        }
+
+        this.addLog(
+          "warn",
+          t("engine.deleteConflictPreserved", { path: item.path, conflictPath })
+        );
         return "conflict";
       }
 
@@ -1485,6 +2024,7 @@ export class SyncEngine {
             mtime: item.local.mtime,
             remoteMtime: item.remote.mtime,
             md5: item.remote.md5 || item.local.md5 || "",
+            localMd5: item.local.md5 || (!settings.enableE2EE ? item.remote.md5 : undefined),
             size: item.local.size,
             remoteSize: item.remote.size,
             fsId: item.remote.fsId
@@ -1496,14 +2036,17 @@ export class SyncEngine {
 
       case "DELETE_LOCAL": {
         if (await ctx.exists(localDiskPath)) {
-          // Re-stat right before deleting to prevent TOCTOU loss if user edited during remote scan
+          // Re-stat right before deleting to prevent TOCTOU loss if user edited during remote scan.
+          // Compare against scanned `item.local` (already verified via mtime/MD5/tombstone) rather than
+          // `item.manifest` so files with pre-scan mtime drift verified by content hash still trash cleanly.
           const currentStat = await ctx.stat(localDiskPath);
+          const expectedStat = item.local ?? item.manifest;
           if (
             currentStat &&
             currentStat.type === "file" &&
-            item.manifest &&
-            (Math.abs(currentStat.mtime - item.manifest.mtime) > 1000 ||
-              currentStat.size !== item.manifest.size)
+            expectedStat &&
+            (Math.abs(currentStat.mtime - expectedStat.mtime) > 1000 ||
+              currentStat.size !== expectedStat.size)
           ) {
             this.addLog("warn", t("engine.deleteLocalSkippedModified", { path: item.path }));
             return "skipped";
@@ -1615,6 +2158,7 @@ export class SyncEngine {
               const remotePath = `${cleanBase}/${canonicalPath}`;
 
               // Explicitly upload with enableE2EE: false -> Pure Plaintext
+              const localPlainMd5 = md5(buffer);
               const res = await this.uploader.uploadFile(remotePath, buffer, {
                 enableE2EE: false
               });
@@ -1627,6 +2171,7 @@ export class SyncEngine {
                 mtime: localMtime,
                 remoteMtime: (res.mtime || Math.floor(Date.now() / 1000)) * 1000,
                 md5: res.md5 || "",
+                localMd5: localPlainMd5,
                 size: buffer.byteLength,
                 remoteSize: res.size,
                 fsId: res.fs_id
@@ -1657,6 +2202,19 @@ export class SyncEngine {
         await Promise.race([allTasksPromise, ctx.abortPromise]);
         if (!ctx.bridgeDead) {
           await ctx.queue.waitAll();
+        }
+
+        // Also re-upload own tombstone shard as plaintext so cloud tombstones stay readable after E2EE is disabled
+        if (this.tombstones.hasOwnEntries() || this.tombstones.isOwnShardPendingUpload()) {
+          const currentDeviceId = await this.ensureDeviceId(settings);
+          try {
+            await this.flushOwnTombstoneShard(cleanBase, currentDeviceId, settings, true);
+            await this.tombstones.save();
+          } catch (err: unknown) {
+            errors++;
+            const detail = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+            this.addLog("warn", t("engine.tombstoneUploadFailed", { detail }));
+          }
         }
 
         this.manifest.setRemoteBasePath(cleanBase);
@@ -1767,8 +2325,13 @@ export class SyncEngine {
 
   private async scanRemoteFiles(
     cleanBase: string
-  ): Promise<{ files: Map<string, RemoteFileInfo>; caseCollisions: string[][] }> {
+  ): Promise<{
+    files: Map<string, RemoteFileInfo>;
+    caseCollisions: string[][];
+    tombstoneShards: RemoteTombstoneShardRef[];
+  }> {
     const result = new Map<string, RemoteFileInfo>();
+    const tombstoneShards: RemoteTombstoneShardRef[] = [];
     const expectedPrefix = `${cleanBase}/`;
 
     const items = await this.client.listAll(cleanBase);
@@ -1784,7 +2347,26 @@ export class SyncEngine {
       }
 
       const relativePath = normalizedItemPath.slice(expectedPrefix.length);
-      if (!relativePath || this.filter.shouldIgnore(relativePath, false)) {
+      if (!relativePath) {
+        continue;
+      }
+
+      // Intercept cloud tombstone shards BEFORE SyncFilter (legacy plugin versions ignore
+      // `/plugins/baidu-netdisk-sync/` automatically for zero-breakage mixed-version safety).
+      const shardDeviceId = extractTombstoneDeviceId(relativePath);
+      if (shardDeviceId) {
+        tombstoneShards.push({
+          deviceId: shardDeviceId,
+          relativePath,
+          remotePath: item.path,
+          fsId: item.fs_id,
+          mtime: (item.server_mtime || 0) * 1000,
+          size: item.size || 0
+        });
+        continue;
+      }
+
+      if (this.filter.shouldIgnore(relativePath, false)) {
         continue;
       }
 
@@ -1821,6 +2403,6 @@ export class SyncEngine {
       }
     }
 
-    return { files: result, caseCollisions };
+    return { files: result, caseCollisions, tombstoneShards };
   }
 }

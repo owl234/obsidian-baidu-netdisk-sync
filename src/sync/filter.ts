@@ -161,13 +161,17 @@ export class SyncFilter {
       normalized === "sync_manifest.json" ||
       normalized.endsWith("/sync_manifest.json") ||
       normalized === "sync_manifest.json.bak" ||
-      normalized.endsWith("/sync_manifest.json.bak")
+      normalized.endsWith("/sync_manifest.json.bak") ||
+      normalized === "tombstone_cache.json" ||
+      normalized.endsWith("/tombstone_cache.json") ||
+      normalized === "tombstone_cache.json.bak" ||
+      normalized.endsWith("/tombstone_cache.json.bak")
     ) {
       return true;
     }
 
-    // Always ignore Obsidian trash folder
-    if (isUnderDir(normalized, ".trash")) {
+    // Always ignore plugin cloud metadata staging folder & Obsidian trash folder
+    if (isUnderDir(normalized, ".bdsync-meta") || isUnderDir(normalized, ".trash")) {
       return true;
     }
 

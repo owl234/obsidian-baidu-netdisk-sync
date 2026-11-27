@@ -99,18 +99,20 @@ function obsidianCli(vaultName, args, timeoutMs = 120000) {
  */
 function obsidianEvalJson(vaultName, bodyCode, timeoutMs = 180000) {
   const wrapped = `
-try {
-  const __res = await (async () => {
+(async () => {
+  try {
+    const __res = await (async () => {
 ${bodyCode}
-  })();
-  return JSON.stringify({ __ok: true, value: __res ?? null });
-} catch (err) {
-  return JSON.stringify({
-    __ok: false,
-    message: err instanceof Error ? err.message : String(err),
-    stack: err instanceof Error ? err.stack : ""
-  });
-}
+    })();
+    return JSON.stringify({ __ok: true, value: __res ?? null });
+  } catch (err) {
+    return JSON.stringify({
+      __ok: false,
+      message: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : ""
+    });
+  }
+})()
 `.trim();
 
   const raw = obsidianCli(vaultName, ["eval", `code=${wrapped}`], timeoutMs);
@@ -216,9 +218,24 @@ async function removeLocalPath(p) {
     }
   }
 }
+function getAllDocs() {
+  const docs = [];
+  if (typeof activeDocument !== "undefined" && activeDocument) docs.push(activeDocument);
+  if (typeof document !== "undefined" && document && !docs.includes(document)) docs.push(document);
+  return docs;
+}
+function queryModalInAnyDoc(selector) {
+  for (const d of getAllDocs()) {
+    const matches = Array.from(d.querySelectorAll(selector));
+    if (matches.length > 0) return { doc: d, el: matches[matches.length - 1] };
+  }
+  return { doc: document, el: null };
+}
 function closeAllModalsAndSettings() {
-  for (const btn of Array.from(document.querySelectorAll(".modal-close-button"))) {
-    btn.click();
+  for (const d of getAllDocs()) {
+    for (const btn of Array.from(d.querySelectorAll(".modal-close-button"))) {
+      btn.click();
+    }
   }
   if (app.setting && app.setting.activeTab) {
     app.setting.close();
@@ -445,10 +462,13 @@ if (await app.vault.adapter.exists(".trash")) {
   }
 }
 
-// 3. Reset manifest baseline & remove .bak
+// 3. Reset manifest baseline & tombstone cache & remove .bak
 await plugin.engine.resetLocalBaseline();
+await plugin.engine.resetTombstoneCache();
 const pluginDir = plugin.manifest.dir || (configDir + "/plugins/${PLUGIN_ID}");
 await removeLocalPath(pluginDir + "/sync_manifest.json.bak");
+await removeLocalPath(pluginDir + "/tombstone_cache.json");
+await removeLocalPath(pluginDir + "/tombstone_cache.json.bak");
 
 // 4. Verify local zero residual
 const rootAfter = await app.vault.adapter.list("");
@@ -1110,7 +1130,7 @@ for (const gf of guardFiles) {
 // Verify SyncLogModal surfaces the warning box & Force Delete recovery control
 app.commands.executeCommandById("${PLUGIN_ID}:baidu-sync-view-logs");
 await sleep(250);
-const warnBox = document.querySelector(".baidu-sync-recovery-section.baidu-sync-warning-box");
+const warnBox = queryModalInAnyDoc(".baidu-sync-recovery-section.baidu-sync-warning-box").el;
 assertTrue(Boolean(warnBox), "SyncLogModal must highlight recovery section on massDeleteAborted");
 const warnButtons = warnBox.querySelectorAll("button.mod-warning");
 assertTrue(warnButtons.length >= 1, "SyncLogModal must render Force Delete warning button");
@@ -1133,8 +1153,78 @@ assertTrue(res.success === false && res.massDeleteAborted === true, "Empty-local
 const remoteStillThere = await plugin.client.listAll(runBase);
 assertTrue(remoteStillThere.length >= 10, "Remote files were wiped despite local-empty mass-delete abort!");
 
-// 4. Corrupted sync_manifest.json recovery via sync_manifest.json.bak
+// 4. L3 Empty-Baseline Safety Guard + SyncLogModal recovery UI + trust-cloud mode
 await plugin.engine.resetLocalBaseline();
+await writeLocalText("e2e-stale-leftover.md", "leftover file that must not resurrect");
+res = await plugin.engine.startSync(false);
+assertTrue(
+  res.success === false && res.staleGuardAborted === true,
+  "Empty baseline connecting to non-empty cloud with local-only file MUST trip staleGuardAborted, got: " + JSON.stringify(res)
+);
+assertTrue(plugin.engine.wasLastRunStaleGuardAborted(), "wasLastRunStaleGuardAborted() must be true");
+assertTrue(
+  plugin.engine.getLastStaleGuardInfo()?.reason === "empty-baseline",
+  "Expected empty-baseline stale guard reason"
+);
+
+// Verify SyncLogModal shows warning box & Trust Cloud / Merge Upload buttons
+app.commands.executeCommandById("${PLUGIN_ID}:baidu-sync-view-logs");
+await sleep(250);
+const staleWarnBox = queryModalInAnyDoc(".baidu-sync-recovery-section.baidu-sync-warning-box").el;
+assertTrue(Boolean(staleWarnBox), "SyncLogModal must highlight recovery section on staleGuardAborted");
+const staleButtons = staleWarnBox.querySelectorAll("button");
+assertTrue(staleButtons.length >= 3, "SyncLogModal must render Trust Cloud, Merge Upload, and Reset Baseline buttons");
+closeAllModalsAndSettings();
+
+// Resolve via trust-cloud -> moves leftover to .trash and pulls remote guard files cleanly
+res = await plugin.engine.startSync(false, { staleResolution: "trust-cloud" });
+assertTrue(res.success, "trust-cloud stale resolution failed: " + JSON.stringify(res));
+assertTrue(!(await app.vault.adapter.exists("e2e-stale-leftover.md")), "trust-cloud must trash unexplained local leftover");
+const remoteAfterTrust = await plugin.client.listAll(runBase);
+assertTrue(
+  !remoteAfterTrust.some((i) => i.path === runBase + "/e2e-stale-leftover.md"),
+  "trust-cloud must NEVER upload unexplained local leftover to Baidu"
+);
+
+// 5. L1 Real-Baidu Cloud Tombstone Shard: prevents stale device (without manifest) from resurrecting deleted file
+const tombTargetContent = "tombstone protected note content " + Date.now();
+await writeLocalText("e2e-tomb-target.md", tombTargetContent);
+res = await plugin.engine.startSync(false);
+assertTrue(res.success, "Initial upload of e2e-tomb-target.md failed: " + JSON.stringify(res));
+
+// Delete locally on Device A -> DELETE_REMOTE + uploads real cloud tombstone shard
+await removeLocalPath("e2e-tomb-target.md");
+res = await plugin.engine.startSync(false);
+assertTrue(res.success && res.stats.deleted >= 1, "Device A delete + tombstone shard upload failed: " + JSON.stringify(res));
+const origDeviceId = plugin.settings.deviceId;
+const shardPath = runBase + "/.bdsync-meta/plugins/baidu-netdisk-sync/tombstones/" + origDeviceId + ".json";
+const itemsWithShard = await plugin.client.listAll(runBase);
+assertTrue(
+  itemsWithShard.some((i) => i.path === shardPath),
+  "Cloud tombstone shard missing on real Baidu Netdisk: " + shardPath
+);
+
+// Simulate stale Device B (different deviceId, wiped manifest & cache, still holding deleted old file locally)
+plugin.settings.deviceId = "dev-e2estaledevice000001";
+await plugin.saveSettings();
+await plugin.engine.resetLocalBaseline();
+await plugin.engine.resetTombstoneCache();
+await writeLocalText("e2e-tomb-target.md", tombTargetContent);
+res = await plugin.engine.startSync(false);
+assertTrue(res.success, "Stale Device B tombstone sync failed: " + JSON.stringify(res));
+assertTrue(res.stats.uploaded === 0, "Stale Device B MUST NOT resurrect tombstoned file, uploaded=" + res.stats.uploaded);
+assertTrue(!(await app.vault.adapter.exists("e2e-tomb-target.md")), "Stale Device B must move tombstoned file to .trash");
+const itemsAfterStaleB = await plugin.client.listAll(runBase);
+assertTrue(
+  !itemsAfterStaleB.some((i) => i.path === runBase + "/e2e-tomb-target.md"),
+  "Deleted file resurrected on Baidu Netdisk!"
+);
+
+// Restore original deviceId for remaining tests
+plugin.settings.deviceId = origDeviceId;
+await plugin.saveSettings();
+
+// 6. Corrupted sync_manifest.json recovery via sync_manifest.json.bak
 await writeLocalText("e2e-bak-test.md", "backup test 1");
 res = await plugin.engine.startSync(false);
 assertTrue(res.success, "Manifest backup step 1 failed");
@@ -1153,10 +1243,10 @@ res = await plugin.engine.startSync(false);
 assertTrue(res.success, "Sync should transparently recover from sync_manifest.json.bak, got: " + JSON.stringify(res));
 
 return {
-  summary: "maxFileSize skip, remoteBase switch, bidirectional mass-delete abort + UI, and manifest .bak recovery all verified"
+  summary: "maxFileSize skip, remoteBase switch, bidirectional mass-delete abort + UI, L3 empty-baseline guard + trust-cloud, L1 real-Baidu cloud tombstone anti-resurrection, and manifest .bak recovery all verified"
 };
 `,
-        240000
+        360000
       );
       return d5;
     });
@@ -1254,7 +1344,8 @@ app.setting.openTabById("${PLUGIN_ID}");
 await sleep(300);
 
 const tabEl = app.setting.activeTab.containerEl;
-const pairingButtons = Array.from(tabEl.querySelectorAll("button"));
+const modalDoc = tabEl.ownerDocument || activeDocument || document;
+const origDeviceId = plugin.settings.deviceId;
 // Section 2 pairing row has CTA Export button followed by Import button in the same .setting-item
 let exportBtn = null;
 let importBtn = null;
@@ -1270,7 +1361,8 @@ assertTrue(Boolean(exportBtn && importBtn), "Could not locate Export / Import pa
 
 exportBtn.click();
 await sleep(250);
-const exportModal = document.querySelector(".modal-container .modal");
+const exportModals = Array.from(modalDoc.querySelectorAll(".modal-container .modal"));
+const exportModal = exportModals[exportModals.length - 1] || queryModalInAnyDoc(".modal-container .modal").el;
 assertTrue(Boolean(exportModal), "ExportConfigModal failed to open");
 
 const pinInput = exportModal.querySelector('input[type="password"]');
@@ -1304,8 +1396,10 @@ await plugin.saveSettings();
 // 3. Open ImportConfigModal -> test Wrong PIN first -> then Correct PIN
 importBtn.click();
 await sleep(250);
-const importModal = document.querySelector(".modal-container .modal");
+const importModals = Array.from(modalDoc.querySelectorAll(".modal-container .modal"));
+const importModal = importModals[importModals.length - 1] || queryModalInAnyDoc(".modal-container .modal").el;
 assertTrue(Boolean(importModal), "ImportConfigModal failed to open");
+const importModalDoc = importModal.ownerDocument || modalDoc;
 
 const codeArea = importModal.querySelector("textarea.baidu-sync-code-area");
 const importPinInput = importModal.querySelector('input[type="password"]');
@@ -1320,7 +1414,7 @@ applyBtn.click();
 await sleep(800);
 
 // Modal must still be open & concurrency must still be 1 (wrong PIN rejected)
-assertTrue(document.body.contains(importModal), "ImportConfigModal should remain open after wrong PIN");
+assertTrue(importModalDoc.body.contains(importModal), "ImportConfigModal should remain open after wrong PIN");
 assertTrue(plugin.settings.concurrency === 1, "Settings must not mutate on wrong PIN");
 
 // Now enter correct PIN
@@ -1331,7 +1425,7 @@ applyBtn.click();
 let importedOk = false;
 for (let i = 0; i < 40; i++) {
   await sleep(150);
-  if (!document.body.contains(importModal)) {
+  if (!importModalDoc.body.contains(importModal)) {
     importedOk = true;
     break;
   }
@@ -1345,10 +1439,14 @@ assertTrue(
   plugin.settings.localIgnoredPatterns === updatedDeviceCanary,
   "Device-only localIgnoredPatterns was overwritten by pairing import!"
 );
+assertTrue(
+  plugin.settings.deviceId === origDeviceId,
+  "Device-only deviceId was overwritten by pairing import!"
+);
 
 closeAllModalsAndSettings();
 return {
-  summary: "BDSYNC:v1 export/import UI verified, wrong PIN rejected, localIgnoredPatterns preserved"
+  summary: "BDSYNC:v1 export/import UI verified, wrong PIN rejected, localIgnoredPatterns & deviceId preserved"
 };
 `,
         120000
@@ -1423,12 +1521,15 @@ app.setting.open();
 app.setting.openTabById("${PLUGIN_ID}");
 await sleep(250);
 const tabEl = app.setting.activeTab.containerEl;
+const modalDoc = tabEl.ownerDocument || activeDocument || document;
 const allBtns = Array.from(tabEl.querySelectorAll("button"));
 const migrationBtn = allBtns[allBtns.length - 1];
 assertTrue(Boolean(migrationBtn), "Missing DecryptMigrationModal button in Settings Section 7");
 migrationBtn.click();
 await sleep(250);
-const migModal = document.querySelector(".modal-container .modal .baidu-sync-migration-status");
+const migModal =
+  modalDoc.querySelector(".modal-container .modal .baidu-sync-migration-status") ||
+  queryModalInAnyDoc(".modal-container .modal .baidu-sync-migration-status").el;
 assertTrue(Boolean(migModal), "DecryptMigrationModal failed to render");
 closeAllModalsAndSettings();
 
@@ -1456,7 +1557,23 @@ return {
 
     // ── D9: Mobile Emulation, UI Layout & Log Secret Sanitization ──────────
     await runDomain("D9", "Mobile Emulation UI Check & Log/Console Secret Sanitization Audit", async () => {
+      const waitEvalReady = async (timeoutMs = 15000) => {
+        const deadline = Date.now() + timeoutMs;
+        let lastErr = null;
+        while (Date.now() < deadline) {
+          try {
+            const ok = obsidianEvalJson(vaultName, `return Boolean(app && app.plugins?.getPlugin("${PLUGIN_ID}"));`, 10000);
+            if (ok) return;
+          } catch (err) {
+            lastErr = err;
+          }
+          await new Promise((r) => setTimeout(r, 400));
+        }
+        throw lastErr || new Error("Timed out waiting for Obsidian renderer after dev:mobile toggle");
+      };
+
       obsidianCli(vaultName, ["dev:mobile", "on"], 15000);
+      await waitEvalReady();
       try {
         obsidianEvalJson(
           vaultName,
@@ -1486,13 +1603,14 @@ closeAllModalsAndSettings();
 await sleep(150);
 app.commands.executeCommandById("${PLUGIN_ID}:baidu-sync-view-logs");
 await sleep(250);
-assertTrue(Boolean(document.querySelector(".baidu-sync-log-modal")), "SyncLogModal failed to render in mobile emulation");
+assertTrue(Boolean(queryModalInAnyDoc(".baidu-sync-log-modal").el), "SyncLogModal failed to render in mobile emulation");
 closeAllModalsAndSettings();
 return true;
 `
         );
       } finally {
         obsidianCli(vaultName, ["dev:mobile", "off"], 15000);
+        await waitEvalReady().catch(() => {});
       }
 
       // Secret sanitization audit across plugin logs + Obsidian console + dev:errors
@@ -1625,8 +1743,11 @@ plugin.resetInterval();
 
 if (!keep) {
   await plugin.engine.resetLocalBaseline();
+  await plugin.engine.resetTombstoneCache();
   const pluginDir = plugin.manifest.dir || (app.vault.configDir + "/plugins/${PLUGIN_ID}");
   await removeLocalPath(pluginDir + "/sync_manifest.json.bak");
+  await removeLocalPath(pluginDir + "/tombstone_cache.json");
+  await removeLocalPath(pluginDir + "/tombstone_cache.json.bak");
 
   // Post-cleanup empirical verification (local + remote)
   const rootAfter = await app.vault.adapter.list("");
